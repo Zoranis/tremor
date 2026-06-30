@@ -1,0 +1,68 @@
+# Tremor capstone — self-contained compose (does NOT merge labs/base/compose.yml).
+#
+# Ships only the upstream vendor mock:
+#   data-init     one-shot: downloads + curates a 7-day GDELT window into the
+#                 gdelt-cache volume. Idempotent (skips if _READY is present).
+#   gdelt-vendor  FastAPI service that reads from that volume. Serves the
+#                 GDELT manifest (/v2/lastupdate.txt) and the three curated
+#                 CSVs per 15-minute slice on a simulated clock.
+#
+# Students add their own services (Kafka, Postgres, monitoring, etc.) below.
+# Container names and host ports are prefixed/shifted so this can coexist with
+# the main course `labs/` (which use the default ports) and with Lume (18100).
+
+name: tremor
+
+volumes:
+  gdelt-cache:
+
+services:
+  data-init:
+    build: ./vendor
+    container_name: tremor-data-init
+    command: ["python", "/app/download_and_curate.py", "/cache"]
+    volumes:
+      - gdelt-cache:/cache
+    # Needs REPLAY_WINDOW_START/END so it knows what slice range to fetch.
+    env_file:
+      - .env
+    restart: "no"
+
+  gdelt-vendor:
+    build: ./vendor
+    container_name: tremor-gdelt-vendor
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    volumes:
+      - gdelt-cache:/cache:ro
+    ports:
+      - "18200:8000"
+    # We don't use env_file here on purpose: env_file values always win over
+    # shell-exported vars, which would defeat `make vendor-chaos` (it exports
+    # the chaos knobs at the shell). Instead use compose variable substitution
+    # — values resolve from shell first, then from .env (compose loads it
+    # automatically), then from the inline default.
+    environment:
+      CACHE_DIR: /cache
+      VENDOR_PUBLIC_BASE: ${VENDOR_PUBLIC_BASE:-http://localhost:18200}
+      REPLAY_SECONDS_PER_SLICE: ${REPLAY_SECONDS_PER_SLICE:-0.45}
+      REPLAY_WINDOW_START: ${REPLAY_WINDOW_START:-2024-01-01}
+      REPLAY_WINDOW_END: ${REPLAY_WINDOW_END:-2024-01-08}
+      REPLAY_LOOP: ${REPLAY_LOOP:-true}
+      VENDOR_LATE_SLICE_RATE: ${VENDOR_LATE_SLICE_RATE:-0.0}
+      VENDOR_PARTIAL_SLICE_RATE: ${VENDOR_PARTIAL_SLICE_RATE:-0.0}
+      VENDOR_STALE_MANIFEST_RATE: ${VENDOR_STALE_MANIFEST_RATE:-0.0}
+      VENDOR_OUTAGE_SCHEDULE: ${VENDOR_OUTAGE_SCHEDULE:-}
+    # host.docker.internal works out of the box on Docker Desktop (mac/windows).
+    # The extra_hosts mapping below makes it resolve on Linux too, so student
+    # services running on the host are reachable from the container.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
