@@ -11,7 +11,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 import requests
 
@@ -38,6 +38,9 @@ class ManifestEntry:
 class PollResult:
     entry: ManifestEntry
     rows: list[dict[str, str]]
+
+
+PersistCallback = Callable[[PollResult], None]
 
 
 def _setup_logger() -> logging.Logger:
@@ -425,6 +428,101 @@ def _download_and_verify(
     return zip_bytes
 
 
+def _log_poll_metrics(
+    logger: logging.Logger,
+    *,
+    manifest_poll_success_count: int,
+    manifest_poll_error_count: int,
+    processed_file_count: int,
+    latest_processed_slice_by_file_type: dict[str, str],
+    latest_lag_seconds_by_file_type: dict[str, float],
+) -> None:
+    log_event(
+        logger,
+        action="poll_metrics",
+        result="summary",
+        manifest_poll_success_count=manifest_poll_success_count,
+        manifest_poll_error_count=manifest_poll_error_count,
+        processed_file_count=processed_file_count,
+        latest_processed_slice_by_file_type=latest_processed_slice_by_file_type,
+        latest_lag_seconds_by_file_type=latest_lag_seconds_by_file_type,
+    )
+
+
+def _emit_alert_events(
+    logger: logging.Logger,
+    *,
+    manifest_poll_success_count: int,
+    manifest_poll_error_count: int,
+    latest_lag_seconds_by_file_type: dict[str, float],
+    alert_manifest_error_threshold: int,
+    alert_lag_seconds_threshold: float,
+    alert_state: dict[str, object] | None = None,
+) -> None:
+    vendor_feed_down_active = False
+    lag_high_active_by_file_type: dict[str, bool] = {}
+    if alert_state is not None:
+        vendor_feed_down_active = bool(alert_state.get("vendor_feed_down_active", False))
+        lag_state = alert_state.get("lag_high_active_by_file_type")
+        if isinstance(lag_state, dict):
+            lag_high_active_by_file_type = {
+                str(k): bool(v) for k, v in lag_state.items()
+            }
+
+    if manifest_poll_error_count >= alert_manifest_error_threshold:
+        if not vendor_feed_down_active:
+            log_event(
+                logger,
+                action="alert",
+                result="firing",
+                alert_name="vendor_feed_down",
+                manifest_poll_error_count=manifest_poll_error_count,
+                threshold=alert_manifest_error_threshold,
+            )
+            vendor_feed_down_active = True
+    elif manifest_poll_success_count > 0:
+        if vendor_feed_down_active:
+            log_event(
+                logger,
+                action="alert",
+                result="cleared",
+                alert_name="vendor_feed_down",
+                manifest_poll_error_count=manifest_poll_error_count,
+                threshold=alert_manifest_error_threshold,
+            )
+            vendor_feed_down_active = False
+
+    for file_type, lag_seconds in latest_lag_seconds_by_file_type.items():
+        lag_alert_active = lag_high_active_by_file_type.get(file_type, False)
+        if lag_seconds >= alert_lag_seconds_threshold:
+            if not lag_alert_active:
+                log_event(
+                    logger,
+                    action="alert",
+                    result="firing",
+                    file_type=file_type,
+                    alert_name="ingest_lag_high",
+                    lag_seconds=lag_seconds,
+                    threshold=alert_lag_seconds_threshold,
+                )
+                lag_high_active_by_file_type[file_type] = True
+        elif lag_alert_active:
+            log_event(
+                logger,
+                action="alert",
+                result="cleared",
+                file_type=file_type,
+                alert_name="ingest_lag_high",
+                lag_seconds=lag_seconds,
+                threshold=alert_lag_seconds_threshold,
+            )
+            lag_high_active_by_file_type[file_type] = False
+
+    if alert_state is not None:
+        alert_state["vendor_feed_down_active"] = vendor_feed_down_active
+        alert_state["lag_high_active_by_file_type"] = lag_high_active_by_file_type
+
+
 def poll_once(
     session: requests.Session,
     *,
@@ -435,6 +533,9 @@ def poll_once(
     max_retries: int = 2,
     backoff_initial_seconds: float = 0.2,
     backoff_max_seconds: float = 2.0,
+    alert_manifest_error_threshold: int = 3,
+    alert_lag_seconds_threshold: float = 1800.0,
+    alert_state: dict[str, object] | None = None,
 ) -> list[PollResult]:
     manifest_url = f"{base_url.rstrip('/')}/v2/lastupdate.txt"
     response = _get_with_retry(
@@ -449,6 +550,23 @@ def poll_once(
         retry_statuses=TRANSIENT_HTTP_STATUSES,
     )
     if response is None:
+        _log_poll_metrics(
+            logger,
+            manifest_poll_success_count=0,
+            manifest_poll_error_count=1,
+            processed_file_count=0,
+            latest_processed_slice_by_file_type={},
+            latest_lag_seconds_by_file_type={},
+        )
+        _emit_alert_events(
+            logger,
+            manifest_poll_success_count=0,
+            manifest_poll_error_count=1,
+            latest_lag_seconds_by_file_type={},
+            alert_manifest_error_threshold=alert_manifest_error_threshold,
+            alert_lag_seconds_threshold=alert_lag_seconds_threshold,
+            alert_state=alert_state,
+        )
         return []
 
     if response.status_code == 503:
@@ -460,6 +578,23 @@ def poll_once(
             url=manifest_url,
             status=response.status_code,
         )
+        _log_poll_metrics(
+            logger,
+            manifest_poll_success_count=0,
+            manifest_poll_error_count=1,
+            processed_file_count=0,
+            latest_processed_slice_by_file_type={},
+            latest_lag_seconds_by_file_type={},
+        )
+        _emit_alert_events(
+            logger,
+            manifest_poll_success_count=0,
+            manifest_poll_error_count=1,
+            latest_lag_seconds_by_file_type={},
+            alert_manifest_error_threshold=alert_manifest_error_threshold,
+            alert_lag_seconds_threshold=alert_lag_seconds_threshold,
+            alert_state=alert_state,
+        )
         return []
 
     if response.status_code != 200:
@@ -470,6 +605,22 @@ def poll_once(
             level=logging.WARNING,
             url=manifest_url,
             status=response.status_code,
+        )
+        _log_poll_metrics(
+            logger,
+            manifest_poll_success_count=0,
+            manifest_poll_error_count=1,
+            processed_file_count=0,
+            latest_processed_slice_by_file_type={},
+            latest_lag_seconds_by_file_type={},
+        )
+        _emit_alert_events(
+            logger,
+            manifest_poll_success_count=0,
+            manifest_poll_error_count=1,
+            latest_lag_seconds_by_file_type={},
+            alert_manifest_error_threshold=alert_manifest_error_threshold,
+            alert_lag_seconds_threshold=alert_lag_seconds_threshold,
         )
         return []
 
@@ -543,6 +694,7 @@ def poll_once(
             row_count=len(rows),
         )
 
+    latest_lag_seconds_by_file_type: dict[str, float] = {}
     simulated_now = _fetch_simulated_now(
         session,
         base_url=base_url,
@@ -565,6 +717,33 @@ def poll_once(
                     simulated_now=simulated_now,
                     lag_seconds=lag_seconds,
                 )
+                latest_lag_seconds_by_file_type[result.entry.file_type] = lag_seconds
+
+    latest_processed_slice_by_file_type: dict[str, str] = {}
+    for result in results:
+        file_type = result.entry.file_type
+        slice_ts = result.entry.slice_ts
+        current = latest_processed_slice_by_file_type.get(file_type)
+        if current is None or slice_ts > current:
+            latest_processed_slice_by_file_type[file_type] = slice_ts
+
+    _log_poll_metrics(
+        logger,
+        manifest_poll_success_count=1,
+        manifest_poll_error_count=0,
+        processed_file_count=len(results),
+        latest_processed_slice_by_file_type=latest_processed_slice_by_file_type,
+        latest_lag_seconds_by_file_type=latest_lag_seconds_by_file_type,
+    )
+    _emit_alert_events(
+        logger,
+        manifest_poll_success_count=1,
+        manifest_poll_error_count=0,
+        latest_lag_seconds_by_file_type=latest_lag_seconds_by_file_type,
+        alert_manifest_error_threshold=alert_manifest_error_threshold,
+        alert_lag_seconds_threshold=alert_lag_seconds_threshold,
+        alert_state=alert_state,
+    )
 
     return results
 
@@ -577,24 +756,92 @@ def poll_forever(
     max_retries: int = 2,
     backoff_initial_seconds: float = 0.2,
     backoff_max_seconds: float = 2.0,
+    alert_manifest_error_threshold: int = 3,
+    alert_lag_seconds_threshold: float = 1800.0,
+    seen: set[tuple[str, str]] | None = None,
+    persist_callback: PersistCallback | None = None,
 ) -> Iterable[PollResult]:
     logger = _setup_logger()
-    seen: set[tuple[str, str]] = set()
+    seen_set: set[tuple[str, str]] = set() if seen is None else set(seen)
+    alert_state: dict[str, object] = {
+        "vendor_feed_down_active": False,
+        "lag_high_active_by_file_type": {},
+    }
 
     with requests.Session() as session:
         while True:
             for result in poll_once(
                 session,
                 base_url=base_url,
-                seen=seen,
+                seen=seen_set,
                 logger=logger,
                 timeout_seconds=timeout_seconds,
                 max_retries=max_retries,
                 backoff_initial_seconds=backoff_initial_seconds,
                 backoff_max_seconds=backoff_max_seconds,
+                alert_manifest_error_threshold=alert_manifest_error_threshold,
+                alert_lag_seconds_threshold=alert_lag_seconds_threshold,
+                alert_state=alert_state,
             ):
+                if persist_callback is not None:
+                    persist_callback(result)
+                    log_event(
+                        logger,
+                        action="db_persist",
+                        result="ok",
+                        slice_ts=result.entry.slice_ts,
+                        file_type=result.entry.file_type,
+                        row_count=len(result.rows),
+                    )
                 yield result
             time.sleep(interval_seconds)
+
+
+def _build_persist_callback(
+    *,
+    database_url: str,
+    logger: logging.Logger,
+    checkpoint_retain_per_file_type: int,
+    checkpoint_compact_every: int,
+) -> tuple[PersistCallback, set[tuple[str, str]], object]:
+    from src.ingest.storage import PersistableResult, PostgresIngestStore
+
+    store = PostgresIngestStore(dsn=database_url)
+    store.open()
+    seen = store.load_seen()
+    log_event(
+        logger,
+        action="db_checkpoint",
+        result="loaded",
+        checkpoint_count=len(seen),
+    )
+    persist_count = 0
+
+    def _persist(result: PollResult) -> None:
+        nonlocal persist_count
+        store.persist(
+            PersistableResult(
+                slice_ts=result.entry.slice_ts,
+                file_type=result.entry.file_type,
+                rows=result.rows,
+            )
+        )
+        persist_count += 1
+
+        if checkpoint_compact_every > 0 and persist_count % checkpoint_compact_every == 0:
+            deleted_count = store.compact_checkpoints(
+                retain_per_file_type=checkpoint_retain_per_file_type
+            )
+            log_event(
+                logger,
+                action="db_checkpoint",
+                result="compacted",
+                deleted_count=deleted_count,
+                retain_per_file_type=checkpoint_retain_per_file_type,
+                compact_every=checkpoint_compact_every,
+            )
+
+    return _persist, seen, store
 
 
 def main() -> int:
@@ -610,17 +857,67 @@ def main() -> int:
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--backoff-initial-seconds", type=float, default=0.2)
     parser.add_argument("--backoff-max-seconds", type=float, default=2.0)
+    parser.add_argument("--alert-manifest-error-threshold", type=int, default=3)
+    parser.add_argument("--alert-lag-seconds-threshold", type=float, default=1800.0)
+    parser.add_argument(
+        "--database-url",
+        default="",
+        help="Optional PostgreSQL DSN. If set, parsed rows are upserted and checkpoints are persisted.",
+    )
+    parser.add_argument(
+        "--checkpoint-retain-per-file-type",
+        type=int,
+        default=192,
+        help="Number of latest done checkpoints to keep per file type.",
+    )
+    parser.add_argument(
+        "--checkpoint-compact-every",
+        type=int,
+        default=10,
+        help="Run checkpoint compaction after this many persisted files (0 disables).",
+    )
     args = parser.parse_args()
 
-    for _ in poll_forever(
-        base_url=args.base_url,
-        interval_seconds=args.interval_seconds,
-        timeout_seconds=args.timeout_seconds,
-        max_retries=args.max_retries,
-        backoff_initial_seconds=args.backoff_initial_seconds,
-        backoff_max_seconds=args.backoff_max_seconds,
-    ):
-        pass
+    logger = _setup_logger()
+    persist_callback: PersistCallback | None = None
+    seen: set[tuple[str, str]] | None = None
+    store = None
+
+    if args.database_url:
+        try:
+            persist_callback, seen, store = _build_persist_callback(
+                database_url=args.database_url,
+                logger=logger,
+                checkpoint_retain_per_file_type=args.checkpoint_retain_per_file_type,
+                checkpoint_compact_every=args.checkpoint_compact_every,
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                action="db_connect",
+                result="error",
+                level=logging.ERROR,
+                error=str(exc),
+            )
+            return 1
+
+    try:
+        for _ in poll_forever(
+            base_url=args.base_url,
+            interval_seconds=args.interval_seconds,
+            timeout_seconds=args.timeout_seconds,
+            max_retries=args.max_retries,
+            backoff_initial_seconds=args.backoff_initial_seconds,
+            backoff_max_seconds=args.backoff_max_seconds,
+            alert_manifest_error_threshold=args.alert_manifest_error_threshold,
+            alert_lag_seconds_threshold=args.alert_lag_seconds_threshold,
+            seen=seen,
+            persist_callback=persist_callback,
+        ):
+            pass
+    finally:
+        if store is not None:
+            store.close()
     return 0
 
 

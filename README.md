@@ -83,3 +83,17 @@ The scaffold deliberately ships a thin `compose.yml`. Add services as you
 need them — copy snippets from the course's `labs/streaming/compose.yml`,
 `labs/monitoring/compose.yml`, etc. There's no opinionated module layout
 under `src/` — design as a team and make your choices defensible.
+
+## Test workflow
+
+- `make test` runs the full suite. Integration tests auto-skip when Postgres
+	is not configured.
+- `make test-integration` runs only Postgres integration tests and requires
+	`TREMOR_TEST_DATABASE_URL`.
+- `make test-ci` runs the full suite but fails fast if
+	`TREMOR_TEST_DATABASE_URL` is not set.
+- `make soak-capture` records vendor health/stats/manifest evidence into
+	`data/evidence/<run_id>/` for baseline and chaos validation.
+
+CI is wired in `.github/workflows/ci.yml` with a Postgres service and
+`TREMOR_TEST_DATABASE_URL` exported for integration coverage.

@@ -14,7 +14,7 @@
 # to design. Add services to compose.yml as you need them.
 # ────────────────────────────────────────────────────────────────────────────
 
-.PHONY: run stop reset logs test vendor-chaos vendor-calm help
+.PHONY: run stop reset logs test test-integration test-ci soak-capture vendor-chaos vendor-calm help
 
 help:
 	@echo ""
@@ -23,6 +23,9 @@ help:
 	@echo "  make reset          Stop + wipe volumes (next run re-downloads + re-curates)"
 	@echo "  make logs           Tail gdelt-vendor logs"
 	@echo "  make test           Run the current automated test suite"
+	@echo "  make test-integration  Run DB integration tests (requires TREMOR_TEST_DATABASE_URL)"
+	@echo "  make test-ci        Run full test suite for CI (requires TREMOR_TEST_DATABASE_URL)"
+	@echo "  make soak-capture   Capture vendor health/manifest evidence into data/evidence"
 	@echo "  make vendor-chaos   Restart gdelt-vendor with late/partial/stale/outage on"
 	@echo "  make vendor-calm    Restart gdelt-vendor with chaos all-zero"
 	@echo ""
@@ -55,6 +58,23 @@ logs:
 
 test:
 	python -m pytest -q
+
+test-integration:
+	@if [ -z "$$TREMOR_TEST_DATABASE_URL" ]; then \
+		echo "TREMOR_TEST_DATABASE_URL is required"; \
+		exit 1; \
+	fi
+	python -m pytest -q tests/test_storage_integration.py
+
+test-ci:
+	@if [ -z "$$TREMOR_TEST_DATABASE_URL" ]; then \
+		echo "TREMOR_TEST_DATABASE_URL is required"; \
+		exit 1; \
+	fi
+	python -m pytest -q
+
+soak-capture:
+	python tools/capture_soak_evidence.py --minutes 30 --interval-seconds 5 --output-dir data/evidence
 
 vendor-chaos:
 	VENDOR_LATE_SLICE_RATE=0.05 \

@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE TABLE IF NOT EXISTS mentions (
-    event_id INTEGER NOT NULL REFERENCES events(event_id),
+    event_id INTEGER NOT NULL,
     mention_time TIMESTAMPTZ,
     source_domain TEXT,
     tone REAL,

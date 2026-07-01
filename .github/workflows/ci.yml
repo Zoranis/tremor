@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: tremor
+          POSTGRES_PASSWORD: tremor
+          POSTGRES_DB: tremor_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tremor -d tremor_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TREMOR_TEST_DATABASE_URL: postgresql://tremor:tremor@localhost:5432/tremor_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest requests "psycopg[binary]"
+
+      - name: Run tests
+        run: make test-ci
