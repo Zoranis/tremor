@@ -1,0 +1,49 @@
+# ─── Tremor vendor mock — replay + chaos configuration ──────────────────────
+#
+# These env vars are read by the gdelt-vendor service at startup (see
+# compose.yml). Restart `gdelt-vendor` after editing to pick up changes:
+#   docker compose restart gdelt-vendor
+# ────────────────────────────────────────────────────────────────────────────
+
+# Replay speed: wall-clock seconds per 15-minute simulated slice.
+# Default 0.45 → 672 slices (7 sim-days) per ~5 wall-min. Raise for slo-mo
+# demos, lower if your pipeline can keep up.
+REPLAY_SECONDS_PER_SLICE=0.45
+
+# Inclusive window of GDELT 2.0 to replay. GDELT 2.0 publishes from
+# 2015-02-18 onward; the default keeps a clean 7-day slice in early 2024.
+# NOTE: data-init must download 672 slices × 3 files = ~2,000 HTTP requests
+# on first run. With 16-way parallelism (DATA_INIT_WORKERS=16) expect 1–3
+# wall-minutes on a good connection. Narrow to a single sim-day (96 slices)
+# for an even faster smoke run:
+#   REPLAY_WINDOW_START=2024-01-01
+#   REPLAY_WINDOW_END=2024-01-01
+REPLAY_WINDOW_START=2024-01-01
+REPLAY_WINDOW_END=2024-01-08
+
+# Concurrent download workers for data-init. 16 is a good default for
+# GDELT's CDN; raise cautiously (rate-limit risk above ~32).
+DATA_INIT_WORKERS=16
+
+# When true, replay loops back to REPLAY_WINDOW_START after reaching END.
+REPLAY_LOOP=true
+
+# ─── Chaos knobs (calm defaults; flip with `make vendor-chaos`) ─────────────
+
+# Probability that, for a given slice, one or more curated files 404 for
+# 30–90 wall-seconds after the manifest first lists them, before serving
+# cleanly. Realistic: 0.02-0.10.
+VENDOR_LATE_SLICE_RATE=0.0
+
+# Probability that, for a given slice, one of the three file types is
+# omitted from the manifest and only appears in a later manifest update.
+VENDOR_PARTIAL_SLICE_RATE=0.0
+
+# Probability that the manifest endpoint keeps returning the prior slice
+# for 1–2 ticks past the expected advance.
+VENDOR_STALE_MANIFEST_RATE=0.0
+
+# Comma-separated outage windows in "HH:MM-HH:MM" simulated-time format.
+# While inside any window the manifest endpoint AND /v2/{file} return 503.
+# Empty = no outages. Example: "03:15-03:20,07:00-07:05"
+VENDOR_OUTAGE_SCHEDULE=
