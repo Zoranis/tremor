@@ -14,7 +14,7 @@
 # to design. Add services to compose.yml as you need them.
 # ────────────────────────────────────────────────────────────────────────────
 
-.PHONY: run stop reset logs vendor-chaos vendor-calm help
+.PHONY: run stop reset logs test vendor-chaos vendor-calm help
 
 help:
 	@echo ""
@@ -22,6 +22,7 @@ help:
 	@echo "  make stop           Stop containers (keeps the gdelt-cache volume)"
 	@echo "  make reset          Stop + wipe volumes (next run re-downloads + re-curates)"
 	@echo "  make logs           Tail gdelt-vendor logs"
+	@echo "  make test           Run the current automated test suite"
 	@echo "  make vendor-chaos   Restart gdelt-vendor with late/partial/stale/outage on"
 	@echo "  make vendor-calm    Restart gdelt-vendor with chaos all-zero"
 	@echo ""
@@ -51,6 +52,9 @@ reset:
 
 logs:
 	docker compose logs -f gdelt-vendor
+
+test:
+	python -m pytest -q
 
 vendor-chaos:
 	VENDOR_LATE_SLICE_RATE=0.05 \
