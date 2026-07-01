@@ -41,6 +41,7 @@ class PollResult:
 
 
 PersistCallback = Callable[[PollResult], None]
+TelemetryHook = Callable[..., None]
 
 
 def _setup_logger() -> logging.Logger:
@@ -75,6 +76,19 @@ def log_event(
     }
     payload.update(fields)
     logger.log(level, json.dumps(payload, sort_keys=True, default=str))
+
+
+def _call_hook(hooks: dict[str, TelemetryHook] | None, name: str, **kwargs: object) -> None:
+    if hooks is None:
+        return
+    hook = hooks.get(name)
+    if hook is None:
+        return
+    try:
+        hook(**kwargs)
+    except Exception:
+        # Telemetry must not break ingestion.
+        return
 
 
 def parse_manifest_line(line: str) -> ManifestEntry | None:
@@ -344,7 +358,10 @@ def _download_and_verify(
     max_retries: int,
     backoff_initial_seconds: float,
     backoff_max_seconds: float,
+    telemetry_hooks: dict[str, TelemetryHook] | None = None,
 ) -> bytes | None:
+    started = time.perf_counter()
+
     response = _get_with_retry(
         session,
         url=entry.url,
@@ -359,6 +376,17 @@ def _download_and_verify(
         file_type=entry.file_type,
     )
     if response is None:
+        _call_hook(
+            telemetry_hooks,
+            "record_file_attempt",
+            slice_ts=entry.slice_ts,
+            file_type=entry.file_type,
+            url=entry.url,
+            status_code=None,
+            success=False,
+            outcome="request_error",
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+        )
         return None
 
     if response.status_code == 404:
@@ -372,6 +400,17 @@ def _download_and_verify(
             url=entry.url,
             status=response.status_code,
         )
+        _call_hook(
+            telemetry_hooks,
+            "record_file_attempt",
+            slice_ts=entry.slice_ts,
+            file_type=entry.file_type,
+            url=entry.url,
+            status_code=response.status_code,
+            success=False,
+            outcome="late_slice_404",
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+        )
         return None
 
     if response.status_code != 200:
@@ -384,6 +423,17 @@ def _download_and_verify(
             level=logging.WARNING,
             url=entry.url,
             status=response.status_code,
+        )
+        _call_hook(
+            telemetry_hooks,
+            "record_file_attempt",
+            slice_ts=entry.slice_ts,
+            file_type=entry.file_type,
+            url=entry.url,
+            status_code=response.status_code,
+            success=False,
+            outcome="http_error",
+            latency_ms=(time.perf_counter() - started) * 1000.0,
         )
         return None
 
@@ -400,6 +450,17 @@ def _download_and_verify(
             expected_bytes=entry.expected_bytes,
             actual_bytes=actual_bytes,
         )
+        _call_hook(
+            telemetry_hooks,
+            "record_file_attempt",
+            slice_ts=entry.slice_ts,
+            file_type=entry.file_type,
+            url=entry.url,
+            status_code=response.status_code,
+            success=False,
+            outcome="bytes_mismatch",
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+        )
         return None
 
     actual_sha1 = _sha1_bytes(zip_bytes)
@@ -414,6 +475,17 @@ def _download_and_verify(
             expected_sha1=entry.expected_sha1,
             actual_sha1=actual_sha1,
         )
+        _call_hook(
+            telemetry_hooks,
+            "record_file_attempt",
+            slice_ts=entry.slice_ts,
+            file_type=entry.file_type,
+            url=entry.url,
+            status_code=response.status_code,
+            success=False,
+            outcome="sha1_mismatch",
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+        )
         return None
 
     log_event(
@@ -424,6 +496,17 @@ def _download_and_verify(
         file_type=entry.file_type,
         bytes=actual_bytes,
         sha1=actual_sha1,
+    )
+    _call_hook(
+        telemetry_hooks,
+        "record_file_attempt",
+        slice_ts=entry.slice_ts,
+        file_type=entry.file_type,
+        url=entry.url,
+        status_code=response.status_code,
+        success=True,
+        outcome="ok",
+        latency_ms=(time.perf_counter() - started) * 1000.0,
     )
     return zip_bytes
 
@@ -458,6 +541,7 @@ def _emit_alert_events(
     alert_manifest_error_threshold: int,
     alert_lag_seconds_threshold: float,
     alert_state: dict[str, object] | None = None,
+    telemetry_hooks: dict[str, TelemetryHook] | None = None,
 ) -> None:
     vendor_feed_down_active = False
     lag_high_active_by_file_type: dict[str, bool] = {}
@@ -479,6 +563,15 @@ def _emit_alert_events(
                 manifest_poll_error_count=manifest_poll_error_count,
                 threshold=alert_manifest_error_threshold,
             )
+            _call_hook(
+                telemetry_hooks,
+                "record_alert_event",
+                alert_name="vendor_feed_down",
+                file_type=None,
+                state="firing",
+                value=float(manifest_poll_error_count),
+                threshold=float(alert_manifest_error_threshold),
+            )
             vendor_feed_down_active = True
     elif manifest_poll_success_count > 0:
         if vendor_feed_down_active:
@@ -489,6 +582,15 @@ def _emit_alert_events(
                 alert_name="vendor_feed_down",
                 manifest_poll_error_count=manifest_poll_error_count,
                 threshold=alert_manifest_error_threshold,
+            )
+            _call_hook(
+                telemetry_hooks,
+                "record_alert_event",
+                alert_name="vendor_feed_down",
+                file_type=None,
+                state="cleared",
+                value=float(manifest_poll_error_count),
+                threshold=float(alert_manifest_error_threshold),
             )
             vendor_feed_down_active = False
 
@@ -505,6 +607,15 @@ def _emit_alert_events(
                     lag_seconds=lag_seconds,
                     threshold=alert_lag_seconds_threshold,
                 )
+                _call_hook(
+                    telemetry_hooks,
+                    "record_alert_event",
+                    alert_name="ingest_lag_high",
+                    file_type=file_type,
+                    state="firing",
+                    value=float(lag_seconds),
+                    threshold=float(alert_lag_seconds_threshold),
+                )
                 lag_high_active_by_file_type[file_type] = True
         elif lag_alert_active:
             log_event(
@@ -515,6 +626,15 @@ def _emit_alert_events(
                 alert_name="ingest_lag_high",
                 lag_seconds=lag_seconds,
                 threshold=alert_lag_seconds_threshold,
+            )
+            _call_hook(
+                telemetry_hooks,
+                "record_alert_event",
+                alert_name="ingest_lag_high",
+                file_type=file_type,
+                state="cleared",
+                value=float(lag_seconds),
+                threshold=float(alert_lag_seconds_threshold),
             )
             lag_high_active_by_file_type[file_type] = False
 
@@ -536,8 +656,10 @@ def poll_once(
     alert_manifest_error_threshold: int = 3,
     alert_lag_seconds_threshold: float = 1800.0,
     alert_state: dict[str, object] | None = None,
+    telemetry_hooks: dict[str, TelemetryHook] | None = None,
 ) -> list[PollResult]:
     manifest_url = f"{base_url.rstrip('/')}/v2/lastupdate.txt"
+    manifest_started = time.perf_counter()
     response = _get_with_retry(
         session,
         url=manifest_url,
@@ -549,7 +671,19 @@ def poll_once(
         backoff_max_seconds=backoff_max_seconds,
         retry_statuses=TRANSIENT_HTTP_STATUSES,
     )
+    manifest_latency_ms = (time.perf_counter() - manifest_started) * 1000.0
+
     if response is None:
+        _call_hook(
+            telemetry_hooks,
+            "record_manifest_poll",
+            status_code=None,
+            success=False,
+            latency_ms=manifest_latency_ms,
+            line_count=0,
+            manifest_latest_slice=None,
+        )
+        _call_hook(telemetry_hooks, "set_degraded_state", degraded_type="vendor_outage", active=True)
         _log_poll_metrics(
             logger,
             manifest_poll_success_count=0,
@@ -566,6 +700,7 @@ def poll_once(
             alert_manifest_error_threshold=alert_manifest_error_threshold,
             alert_lag_seconds_threshold=alert_lag_seconds_threshold,
             alert_state=alert_state,
+            telemetry_hooks=telemetry_hooks,
         )
         return []
 
@@ -578,6 +713,16 @@ def poll_once(
             url=manifest_url,
             status=response.status_code,
         )
+        _call_hook(
+            telemetry_hooks,
+            "record_manifest_poll",
+            status_code=response.status_code,
+            success=False,
+            latency_ms=manifest_latency_ms,
+            line_count=0,
+            manifest_latest_slice=None,
+        )
+        _call_hook(telemetry_hooks, "set_degraded_state", degraded_type="vendor_outage", active=True)
         _log_poll_metrics(
             logger,
             manifest_poll_success_count=0,
@@ -594,6 +739,7 @@ def poll_once(
             alert_manifest_error_threshold=alert_manifest_error_threshold,
             alert_lag_seconds_threshold=alert_lag_seconds_threshold,
             alert_state=alert_state,
+            telemetry_hooks=telemetry_hooks,
         )
         return []
 
@@ -606,6 +752,16 @@ def poll_once(
             url=manifest_url,
             status=response.status_code,
         )
+        _call_hook(
+            telemetry_hooks,
+            "record_manifest_poll",
+            status_code=response.status_code,
+            success=False,
+            latency_ms=manifest_latency_ms,
+            line_count=0,
+            manifest_latest_slice=None,
+        )
+        _call_hook(telemetry_hooks, "set_degraded_state", degraded_type="vendor_outage", active=True)
         _log_poll_metrics(
             logger,
             manifest_poll_success_count=0,
@@ -621,10 +777,24 @@ def poll_once(
             latest_lag_seconds_by_file_type={},
             alert_manifest_error_threshold=alert_manifest_error_threshold,
             alert_lag_seconds_threshold=alert_lag_seconds_threshold,
+            alert_state=alert_state,
+            telemetry_hooks=telemetry_hooks,
         )
         return []
 
+    _call_hook(telemetry_hooks, "set_degraded_state", degraded_type="vendor_outage", active=False)
+
     entries = parse_manifest(response.text, logger)
+    manifest_latest_slice = max((entry.slice_ts for entry in entries), default=None)
+    _call_hook(
+        telemetry_hooks,
+        "record_manifest_poll",
+        status_code=response.status_code,
+        success=True,
+        latency_ms=manifest_latency_ms,
+        line_count=len(entries),
+        manifest_latest_slice=manifest_latest_slice,
+    )
     log_event(
         logger,
         action="manifest_poll",
@@ -635,6 +805,7 @@ def poll_once(
 
     by_slice: dict[str, set[str]] = {}
     for entry in entries:
+        _call_hook(telemetry_hooks, "mark_manifest_slice_seen", slice_ts=entry.slice_ts)
         by_slice.setdefault(entry.slice_ts, set()).add(entry.file_type)
 
     for slice_ts, present_types in by_slice.items():
@@ -662,15 +833,27 @@ def poll_once(
             )
             continue
 
-        zip_bytes = _download_and_verify(
-            session,
-            entry,
-            logger,
-            timeout_seconds,
-            max_retries=max_retries,
-            backoff_initial_seconds=backoff_initial_seconds,
-            backoff_max_seconds=backoff_max_seconds,
-        )
+        if telemetry_hooks is None:
+            zip_bytes = _download_and_verify(
+                session,
+                entry,
+                logger,
+                timeout_seconds,
+                max_retries=max_retries,
+                backoff_initial_seconds=backoff_initial_seconds,
+                backoff_max_seconds=backoff_max_seconds,
+            )
+        else:
+            zip_bytes = _download_and_verify(
+                session,
+                entry,
+                logger,
+                timeout_seconds,
+                max_retries=max_retries,
+                backoff_initial_seconds=backoff_initial_seconds,
+                backoff_max_seconds=backoff_max_seconds,
+                telemetry_hooks=telemetry_hooks,
+            )
         if zip_bytes is None:
             continue
 
@@ -743,7 +926,54 @@ def poll_once(
         alert_manifest_error_threshold=alert_manifest_error_threshold,
         alert_lag_seconds_threshold=alert_lag_seconds_threshold,
         alert_state=alert_state,
+        telemetry_hooks=telemetry_hooks,
     )
+
+    if alert_state is not None and manifest_latest_slice is not None:
+        previous_latest = alert_state.get("last_manifest_latest_slice")
+        previous_repeats = int(alert_state.get("manifest_repeat_count", 0))
+        if previous_latest == manifest_latest_slice:
+            repeat_count = previous_repeats + 1
+        else:
+            repeat_count = 0
+
+        stale_active = bool(alert_state.get("stale_manifest_active", False))
+        should_be_active = repeat_count >= 1
+
+        if should_be_active and not stale_active:
+            log_event(
+                logger,
+                action="degraded",
+                result="firing",
+                degraded_type="stale_manifest",
+                manifest_latest_slice=manifest_latest_slice,
+                repeat_count=repeat_count,
+            )
+            _call_hook(
+                telemetry_hooks,
+                "set_degraded_state",
+                degraded_type="stale_manifest",
+                active=True,
+            )
+            alert_state["stale_manifest_active"] = True
+        elif (not should_be_active) and stale_active:
+            log_event(
+                logger,
+                action="degraded",
+                result="cleared",
+                degraded_type="stale_manifest",
+                manifest_latest_slice=manifest_latest_slice,
+            )
+            _call_hook(
+                telemetry_hooks,
+                "set_degraded_state",
+                degraded_type="stale_manifest",
+                active=False,
+            )
+            alert_state["stale_manifest_active"] = False
+
+        alert_state["manifest_repeat_count"] = repeat_count
+        alert_state["last_manifest_latest_slice"] = manifest_latest_slice
 
     return results
 
@@ -760,12 +990,16 @@ def poll_forever(
     alert_lag_seconds_threshold: float = 1800.0,
     seen: set[tuple[str, str]] | None = None,
     persist_callback: PersistCallback | None = None,
+    telemetry_hooks: dict[str, TelemetryHook] | None = None,
 ) -> Iterable[PollResult]:
     logger = _setup_logger()
     seen_set: set[tuple[str, str]] = set() if seen is None else set(seen)
     alert_state: dict[str, object] = {
         "vendor_feed_down_active": False,
         "lag_high_active_by_file_type": {},
+        "stale_manifest_active": False,
+        "manifest_repeat_count": 0,
+        "last_manifest_latest_slice": None,
     }
 
     with requests.Session() as session:
@@ -782,6 +1016,7 @@ def poll_forever(
                 alert_manifest_error_threshold=alert_manifest_error_threshold,
                 alert_lag_seconds_threshold=alert_lag_seconds_threshold,
                 alert_state=alert_state,
+                telemetry_hooks=telemetry_hooks,
             ):
                 if persist_callback is not None:
                     persist_callback(result)
@@ -852,7 +1087,13 @@ def main() -> int:
         )
     )
     parser.add_argument("--base-url", default="http://localhost:18200")
-    parser.add_argument("--interval-seconds", type=float, default=0.45)
+    parser.add_argument(
+        "--poll-profile",
+        choices=("dev", "prod"),
+        default="dev",
+        help="Polling profile: dev keeps fast replay polling, prod uses one-minute cadence.",
+    )
+    parser.add_argument("--interval-seconds", type=float, default=None)
     parser.add_argument("--timeout-seconds", type=float, default=15.0)
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--backoff-initial-seconds", type=float, default=0.2)
@@ -880,6 +1121,7 @@ def main() -> int:
 
     logger = _setup_logger()
     persist_callback: PersistCallback | None = None
+    telemetry_hooks: dict[str, TelemetryHook] | None = None
     seen: set[tuple[str, str]] | None = None
     store = None
 
@@ -901,18 +1143,36 @@ def main() -> int:
             )
             return 1
 
+    if store is not None:
+        telemetry_hooks = {
+            "record_manifest_poll": store.record_manifest_poll,
+            "record_file_attempt": store.record_file_attempt,
+            "record_alert_event": store.record_alert_event,
+            "mark_manifest_slice_seen": store.mark_manifest_slice_seen,
+            "set_degraded_state": store.set_degraded_state,
+        }
+
+    interval_seconds = args.interval_seconds
+    if interval_seconds is None:
+        interval_seconds = 60.0 if args.poll_profile == "prod" else 0.45
+
+    alert_manifest_error_threshold = args.alert_manifest_error_threshold
+    if args.poll_profile == "prod" and args.alert_manifest_error_threshold == 3:
+        alert_manifest_error_threshold = 1
+
     try:
         for _ in poll_forever(
             base_url=args.base_url,
-            interval_seconds=args.interval_seconds,
+            interval_seconds=interval_seconds,
             timeout_seconds=args.timeout_seconds,
             max_retries=args.max_retries,
             backoff_initial_seconds=args.backoff_initial_seconds,
             backoff_max_seconds=args.backoff_max_seconds,
-            alert_manifest_error_threshold=args.alert_manifest_error_threshold,
+            alert_manifest_error_threshold=alert_manifest_error_threshold,
             alert_lag_seconds_threshold=args.alert_lag_seconds_threshold,
             seen=seen,
             persist_callback=persist_callback,
+            telemetry_hooks=telemetry_hooks,
         ):
             pass
     finally:

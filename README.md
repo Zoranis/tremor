@@ -1,8 +1,8 @@
 # Tremor — newsroom story-lead desk (capstone C)
 
-Your job is to design the system. **This scaffold only ships the upstream
-vendor mock and the dataset bootstrap.** Everything else — ingest, storage,
-the operational dashboard, the analyst SQL surface, monitoring — is yours.
+Your job is to design the system. The repository now includes a baseline
+end-to-end stack (vendor + ingest + Postgres + dashboard API) that you can
+extend for your defense.
 
 **Start here:** [`BRIEF.md`](./BRIEF.md).
 
@@ -27,10 +27,13 @@ the volume and forces a re-download.
 
 ## What's running
 
-| Service        | Purpose                                                   | URL                           |
-|----------------|-----------------------------------------------------------|-------------------------------|
-| `data-init`    | One-shot: download + curate 7-day GDELT window.           | (no port; exits when done)    |
-| `gdelt-vendor` | FastAPI mock of GDELT 2.0. Serves manifest + curated zips. | http://localhost:18200       |
+| Service         | Purpose                                                      | URL                        |
+|-----------------|--------------------------------------------------------------|----------------------------|
+| `data-init`     | One-shot: download + curate 7-day GDELT window.              | (no port; exits when done) |
+| `gdelt-vendor`  | FastAPI mock of GDELT 2.0. Serves manifest + curated zips.   | http://localhost:18200     |
+| `postgres`      | Operational/analyst storage for ingest and observability.    | localhost:15432            |
+| `ingest-poller` | Polls manifest, verifies files, parses, persists, alerts.    | (no port)                  |
+| `dashboard`     | Lightweight dashboard metrics API for one-screen operations. | http://localhost:18600     |
 
 Useful endpoints on `gdelt-vendor`:
 
@@ -40,6 +43,10 @@ Useful endpoints on `gdelt-vendor`:
 - `GET /v2/lastupdate.txt` — manifest: 3 lines of `<bytes> <sha1> <url>`
 - `GET /v2/{YYYYMMDDHHMMSS}.{events|mentions|articles}.csv.zip` — curated zip
 - `GET /simulated_now` — debug helper
+
+Useful endpoint on `dashboard`:
+
+- `GET /metrics` — slice lag, 5-minute ingestion rate, poll health, alerts, degraded windows
 
 ### Sample calls
 

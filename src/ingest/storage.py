@@ -52,6 +52,8 @@ class PostgresIngestStore:
         conn = self._require_conn()
         with conn.transaction():
             with conn.cursor() as cur:
+                self._mark_manifest_slice_seen(cur, result.slice_ts)
+
                 if result.file_type == "events":
                     self._insert_events(cur, result.rows, result.slice_ts)
                 elif result.file_type == "mentions":
@@ -70,6 +72,146 @@ class PostgresIngestStore:
                     """,
                     (result.slice_ts, result.file_type),
                 )
+                self._mark_slice_file_done(cur, result.slice_ts, result.file_type)
+
+    def mark_manifest_slice_seen(self, *, slice_ts: str) -> None:
+        conn = self._require_conn()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                self._mark_manifest_slice_seen(cur, slice_ts)
+
+    def record_manifest_poll(
+        self,
+        *,
+        status_code: int | None,
+        success: bool,
+        latency_ms: float,
+        line_count: int,
+        manifest_latest_slice: str | None,
+    ) -> None:
+        conn = self._require_conn()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ingest_manifest_polls (
+                        polled_at,
+                        status_code,
+                        success,
+                        latency_ms,
+                        line_count,
+                        manifest_latest_slice
+                    )
+                    VALUES (NOW(), %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        status_code,
+                        success,
+                        latency_ms,
+                        line_count,
+                        manifest_latest_slice,
+                    ),
+                )
+
+    def record_file_attempt(
+        self,
+        *,
+        slice_ts: str,
+        file_type: str,
+        url: str,
+        status_code: int | None,
+        success: bool,
+        outcome: str,
+        latency_ms: float,
+    ) -> None:
+        conn = self._require_conn()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ingest_file_attempts (
+                        attempted_at,
+                        slice_ts,
+                        file_type,
+                        url,
+                        status_code,
+                        success,
+                        outcome,
+                        latency_ms
+                    )
+                    VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        slice_ts,
+                        file_type,
+                        url,
+                        status_code,
+                        success,
+                        outcome,
+                        latency_ms,
+                    ),
+                )
+
+    def record_alert_event(
+        self,
+        *,
+        alert_name: str,
+        file_type: str | None,
+        state: str,
+        value: float,
+        threshold: float,
+    ) -> None:
+        conn = self._require_conn()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ingest_alert_events (
+                        observed_at,
+                        alert_name,
+                        file_type,
+                        state,
+                        value,
+                        threshold
+                    )
+                    VALUES (NOW(), %s, %s, %s, %s, %s)
+                    """,
+                    (alert_name, file_type, state, value, threshold),
+                )
+
+    def set_degraded_state(self, *, degraded_type: str, active: bool) -> None:
+        conn = self._require_conn()
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if active:
+                    cur.execute(
+                        """
+                        INSERT INTO ingest_degraded_windows (degraded_type, started_at, active)
+                        SELECT %s, NOW(), TRUE
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM ingest_degraded_windows
+                            WHERE degraded_type = %s AND active = TRUE
+                        )
+                        """,
+                        (degraded_type, degraded_type),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE ingest_degraded_windows
+                        SET active = FALSE,
+                            ended_at = COALESCE(ended_at, NOW())
+                        WHERE id = (
+                            SELECT id
+                            FROM ingest_degraded_windows
+                            WHERE degraded_type = %s AND active = TRUE
+                            ORDER BY started_at DESC
+                            LIMIT 1
+                        )
+                        """,
+                        (degraded_type,),
+                    )
 
     def compact_checkpoints(self, *, retain_per_file_type: int) -> int:
         if retain_per_file_type <= 0:
@@ -133,6 +275,51 @@ class PostgresIngestStore:
                     )
                     """
                 )
+
+    @staticmethod
+    def _mark_manifest_slice_seen(cur, slice_ts: str) -> None:
+        cur.execute(
+            """
+            INSERT INTO ingest_slice_status (slice_ts, manifest_seen_at)
+            VALUES (%s, NOW())
+            ON CONFLICT (slice_ts)
+            DO UPDATE SET manifest_seen_at = LEAST(ingest_slice_status.manifest_seen_at, NOW())
+            """,
+            (slice_ts,),
+        )
+
+    @staticmethod
+    def _mark_slice_file_done(cur, slice_ts: str, file_type: str) -> None:
+        if file_type not in {"events", "mentions", "articles"}:
+            return
+
+        set_clause = {
+            "events": "events_done = TRUE",
+            "mentions": "mentions_done = TRUE",
+            "articles": "articles_done = TRUE",
+        }[file_type]
+
+        cur.execute(
+            f"""
+            INSERT INTO ingest_slice_status (slice_ts, manifest_seen_at, {file_type}_done)
+            VALUES (%s, NOW(), TRUE)
+            ON CONFLICT (slice_ts)
+            DO UPDATE SET {set_clause}
+            """,
+            (slice_ts,),
+        )
+
+        cur.execute(
+            """
+            UPDATE ingest_slice_status
+            SET fully_processed_at = COALESCE(fully_processed_at, NOW())
+            WHERE slice_ts = %s
+              AND events_done = TRUE
+              AND mentions_done = TRUE
+              AND articles_done = TRUE
+            """,
+            (slice_ts,),
+        )
 
     def _read_schema_sql(self) -> Query:
         here = Path(__file__).resolve()

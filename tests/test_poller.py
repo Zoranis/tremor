@@ -117,6 +117,7 @@ def test_poll_once_emits_lag_check_with_expected_lag_seconds(monkeypatch):
         max_retries,
         backoff_initial_seconds,
         backoff_max_seconds,
+        telemetry_hooks=None,
     ):
         return b"zip-bytes"
 
@@ -176,6 +177,7 @@ def test_poll_once_emits_poll_metrics_summary_on_success(monkeypatch):
         max_retries,
         backoff_initial_seconds,
         backoff_max_seconds,
+        telemetry_hooks=None,
     ):
         return b"zip-bytes"
 
@@ -300,6 +302,48 @@ def test_poll_once_emits_vendor_feed_down_alert_on_manifest_error(monkeypatch):
     ]
     assert len(alert_events) == 1
     assert alert_events[0]["manifest_poll_error_count"] == 1
+
+
+def test_poll_once_vendor_feed_down_alert_fires_within_timing_budget(monkeypatch):
+    logger = _test_logger()
+    events = []
+    sleeps = []
+
+    def _capture_log_event(logger, **kwargs):
+        events.append(kwargs)
+
+    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    manifest_url = "http://localhost:18200/v2/lastupdate.txt"
+    session = _FakeSession(
+        {
+            manifest_url: _FakeResponse(status_code=503, text="service unavailable"),
+        }
+    )
+
+    results = poller.poll_once(
+        session,
+        base_url="http://localhost:18200",
+        seen=set(),
+        logger=logger,
+        timeout_seconds=5.0,
+        max_retries=2,
+        backoff_initial_seconds=0.01,
+        backoff_max_seconds=0.02,
+        alert_manifest_error_threshold=1,
+    )
+
+    assert results == []
+    assert sum(sleeps) < 60.0
+    alert_events = [
+        e
+        for e in events
+        if e.get("action") == "alert"
+        and e.get("result") == "firing"
+        and e.get("alert_name") == "vendor_feed_down"
+    ]
+    assert len(alert_events) == 1
 
 
 def test_poll_once_emits_high_lag_alert_when_threshold_exceeded(monkeypatch):
@@ -919,3 +963,145 @@ def test_poll_once_repoll_skips_already_seen_files(monkeypatch):
         and e.get("file_type") == "events"
     ]
     assert len(skip_seen_events) == 1
+
+
+def test_poll_once_calls_manifest_poll_telemetry_hook(monkeypatch):
+    logger = _test_logger()
+    records = []
+
+    def _fake_download_and_verify(
+        session,
+        entry,
+        logger,
+        timeout_seconds,
+        max_retries,
+        backoff_initial_seconds,
+        backoff_max_seconds,
+        telemetry_hooks=None,
+    ):
+        return b"zip-bytes"
+
+    def _fake_parse_zip_csv(zip_bytes, *, slice_ts, file_type, logger):
+        return [{"ok": "1"}]
+
+    monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
+    monkeypatch.setattr(poller, "_parse_zip_csv", _fake_parse_zip_csv)
+
+    manifest_url = "http://localhost:18200/v2/lastupdate.txt"
+    simulated_now_url = "http://localhost:18200/simulated_now"
+    manifest_text = (
+        "100 1111111111111111111111111111111111111111 "
+        "http://localhost:18200/v2/20240101100000.events.csv.zip\n"
+    )
+    session = _FakeSession(
+        {
+            manifest_url: _FakeResponse(status_code=200, text=manifest_text),
+            simulated_now_url: _FakeResponse(
+                status_code=200,
+                text='{"simulated_now":"2024-01-01T10:15:00Z"}',
+                json_payload={"simulated_now": "2024-01-01T10:15:00Z"},
+            ),
+        }
+    )
+
+    _ = poller.poll_once(
+        session,
+        base_url="http://localhost:18200",
+        seen=set(),
+        logger=logger,
+        timeout_seconds=5.0,
+        telemetry_hooks={"record_manifest_poll": lambda **kw: records.append(kw)},
+    )
+
+    assert len(records) == 1
+    assert records[0]["success"] is True
+    assert records[0]["line_count"] == 1
+    assert records[0]["manifest_latest_slice"] == "20240101100000"
+
+
+def test_poll_once_stale_manifest_degraded_window_transitions(monkeypatch):
+    logger = _test_logger()
+    degraded_calls = []
+
+    def _fake_download_and_verify(
+        session,
+        entry,
+        logger,
+        timeout_seconds,
+        max_retries,
+        backoff_initial_seconds,
+        backoff_max_seconds,
+        telemetry_hooks=None,
+    ):
+        return b"zip-bytes"
+
+    def _fake_parse_zip_csv(zip_bytes, *, slice_ts, file_type, logger):
+        return [{"ok": file_type}]
+
+    monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
+    monkeypatch.setattr(poller, "_parse_zip_csv", _fake_parse_zip_csv)
+
+    manifest_url = "http://localhost:18200/v2/lastupdate.txt"
+    simulated_now_url = "http://localhost:18200/simulated_now"
+    manifest_a = (
+        "100 1111111111111111111111111111111111111111 "
+        "http://localhost:18200/v2/20240101100000.events.csv.zip\n"
+    )
+    manifest_b = (
+        "100 1111111111111111111111111111111111111111 "
+        "http://localhost:18200/v2/20240101101500.events.csv.zip\n"
+    )
+
+    alert_state = {
+        "vendor_feed_down_active": False,
+        "lag_high_active_by_file_type": {},
+        "stale_manifest_active": False,
+        "manifest_repeat_count": 0,
+        "last_manifest_latest_slice": None,
+    }
+
+    shared_responses = {
+        simulated_now_url: _FakeResponse(
+            status_code=200,
+            text='{"simulated_now":"2024-01-01T10:15:00Z"}',
+            json_payload={"simulated_now": "2024-01-01T10:15:00Z"},
+        )
+    }
+
+    session_1 = _FakeSession({manifest_url: _FakeResponse(status_code=200, text=manifest_a), **shared_responses})
+    session_2 = _FakeSession({manifest_url: _FakeResponse(status_code=200, text=manifest_a), **shared_responses})
+    session_3 = _FakeSession({manifest_url: _FakeResponse(status_code=200, text=manifest_b), **shared_responses})
+
+    hooks = {"set_degraded_state": lambda **kw: degraded_calls.append(kw)}
+
+    _ = poller.poll_once(
+        session_1,
+        base_url="http://localhost:18200",
+        seen=set(),
+        logger=logger,
+        timeout_seconds=5.0,
+        alert_state=alert_state,
+        telemetry_hooks=hooks,
+    )
+    _ = poller.poll_once(
+        session_2,
+        base_url="http://localhost:18200",
+        seen=set(),
+        logger=logger,
+        timeout_seconds=5.0,
+        alert_state=alert_state,
+        telemetry_hooks=hooks,
+    )
+    _ = poller.poll_once(
+        session_3,
+        base_url="http://localhost:18200",
+        seen=set(),
+        logger=logger,
+        timeout_seconds=5.0,
+        alert_state=alert_state,
+        telemetry_hooks=hooks,
+    )
+
+    stale_calls = [c for c in degraded_calls if c.get("degraded_type") == "stale_manifest"]
+    assert stale_calls[0]["active"] is True
+    assert stale_calls[-1]["active"] is False

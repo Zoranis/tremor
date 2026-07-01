@@ -15,6 +15,7 @@ name: tremor
 
 volumes:
   gdelt-cache:
+  tremor-pgdata:
 
 services:
   data-init:
@@ -60,6 +61,67 @@ services:
     # services running on the host are reachable from the container.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: tremor-postgres
+    environment:
+      POSTGRES_DB: tremor
+      POSTGRES_USER: tremor
+      POSTGRES_PASSWORD: tremor
+    ports:
+      - "15432:5432"
+    volumes:
+      - tremor-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tremor -d tremor"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  ingest-poller:
+    build: .
+    container_name: tremor-ingest-poller
+    command:
+      [
+        "python",
+        "-m",
+        "src.ingest.poller",
+        "--base-url",
+        "http://gdelt-vendor:8000",
+        "--poll-profile",
+        "${INGEST_POLL_PROFILE:-prod}",
+        "--database-url",
+        "${DATABASE_URL:-postgresql://tremor:tremor@postgres:5432/tremor}",
+      ]
+    depends_on:
+      gdelt-vendor:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://tremor:tremor@postgres:5432/tremor}
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: tremor-dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://tremor:tremor@postgres:5432/tremor}
+    ports:
+      - "18600:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
       interval: 5s

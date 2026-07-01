@@ -5,6 +5,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 
 import requests
 
@@ -44,6 +45,27 @@ def _safe_get_text(session: requests.Session, url: str, timeout: float) -> tuple
     return response.status_code, response.text, None
 
 
+def _capture_outage_timing(session: requests.Session, base_url: str, timeout: float, interval_seconds: float) -> dict:
+    start = time.perf_counter()
+    deadline = start + max(60.0, interval_seconds * 6)
+    samples = []
+    last_status = None
+
+    while time.perf_counter() < deadline:
+        status, _, error = _safe_get_text(session, f"{base_url.rstrip('/')}/v2/lastupdate.txt", timeout)
+        samples.append({"status": status, "error": error, "at_seconds": round(time.perf_counter() - start, 3)})
+        last_status = status
+        if status == 503:
+            break
+        time.sleep(interval_seconds)
+
+    return {
+        "observed_503": last_status == 503,
+        "elapsed_seconds": round(time.perf_counter() - start, 3),
+        "samples": samples,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Capture vendor soak evidence to JSONL and summary files.")
     parser.add_argument("--base-url", default="http://localhost:18200")
@@ -67,6 +89,16 @@ def main() -> int:
     health_errors = 0
     stats_errors = 0
     manifest_errors = 0
+    dashboard_errors = 0
+    outage_timing = None
+
+    dashboard_status, dashboard_json, dashboard_error = _safe_get_json(
+        session, f"{args.base_url.rstrip('/')}/metrics", args.timeout_seconds
+    )
+    if dashboard_status != 200:
+        dashboard_errors += 1
+    else:
+        outage_timing = _capture_outage_timing(session, args.base_url, args.timeout_seconds, args.interval_seconds)
 
     with requests.Session() as session, timeline_path.open("w", encoding="utf-8") as timeline:
         for _ in range(total_samples):
@@ -107,6 +139,11 @@ def main() -> int:
                     "error": stats_error,
                     "payload": stats_json,
                 },
+                "dashboard": {
+                    "status": dashboard_status,
+                    "error": dashboard_error,
+                    "payload": dashboard_json,
+                },
                 "manifest": {
                     "status": manifest_status,
                     "error": manifest_error,
@@ -129,7 +166,9 @@ def main() -> int:
         "health_errors": health_errors,
         "stats_errors": stats_errors,
         "manifest_errors": manifest_errors,
+        "dashboard_errors": dashboard_errors,
         "manifest_stale_count": manifest_stale_count,
+        "outage_timing": outage_timing,
         "artifacts": {
             "timeline": str(timeline_path),
             "summary": str(summary_path),
@@ -149,7 +188,9 @@ def main() -> int:
                 f"- Health errors: {health_errors}",
                 f"- Stats errors: {stats_errors}",
                 f"- Manifest errors: {manifest_errors}",
+                f"- Dashboard errors: {dashboard_errors}",
                 f"- Manifest stale samples: {manifest_stale_count}",
+                f"- Outage timing sample: {json.dumps(outage_timing, sort_keys=True) if outage_timing is not None else 'n/a'}",
                 "",
                 "Add operator interpretation here: observed outage windows, lag trend behavior, and recovery details.",
             ]

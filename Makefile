@@ -14,37 +14,59 @@
 # to design. Add services to compose.yml as you need them.
 # ────────────────────────────────────────────────────────────────────────────
 
-.PHONY: run stop reset logs test test-integration test-ci soak-capture vendor-chaos vendor-calm help
+.PHONY: run run-dev run-prod-profile stop reset logs logs-dashboard test test-integration test-ci soak-capture validate-restart vendor-chaos vendor-calm help
 
 help:
 	@echo ""
-	@echo "  make run            Build vendor image, run data-init, start gdelt-vendor"
+	@echo "  make run            Build and start full stack (vendor + postgres + ingest + dashboard)"
+	@echo "  make run-dev        Start full stack with fast polling profile"
+	@echo "  make run-prod-profile  Start full stack with 60s polling profile"
 	@echo "  make stop           Stop containers (keeps the gdelt-cache volume)"
 	@echo "  make reset          Stop + wipe volumes (next run re-downloads + re-curates)"
 	@echo "  make logs           Tail gdelt-vendor logs"
+	@echo "  make logs-dashboard Tail dashboard logs"
 	@echo "  make test           Run the current automated test suite"
 	@echo "  make test-integration  Run DB integration tests (requires TREMOR_TEST_DATABASE_URL)"
 	@echo "  make test-ci        Run full test suite for CI (requires TREMOR_TEST_DATABASE_URL)"
 	@echo "  make soak-capture   Capture vendor health/manifest evidence into data/evidence"
+	@echo "  make validate-restart Validate a docker compose restart path"
 	@echo "  make vendor-chaos   Restart gdelt-vendor with late/partial/stale/outage on"
 	@echo "  make vendor-calm    Restart gdelt-vendor with chaos all-zero"
 	@echo ""
-	@echo "  Vendor API:  http://localhost:18200/docs"
+	@echo "  Vendor API:      http://localhost:18200/docs"
+	@echo "  Dashboard API:   http://localhost:18600/metrics"
+	@echo "  Postgres host:   localhost:15432 (db/user/pass: tremor)"
 	@echo "  Healthcheck: http://localhost:18200/healthz"
 	@echo ""
 
 run:
-	docker compose up -d --build
+	INGEST_POLL_PROFILE=prod docker compose up -d --build
 	@echo ""
 	@echo "=============================================================="
-	@echo " Tremor vendor mock is starting."
+	@echo " Tremor full stack is starting (prod profile)."
+	@echo "   Poll cadence: 60s"
+	@echo "   Vendor docs:    http://localhost:18200/docs"
+	@echo "   Dashboard API:  http://localhost:18600/metrics"
+	@echo "   Postgres:       localhost:15432"
+	@echo "=============================================================="
+
+run-dev:
+	INGEST_POLL_PROFILE=dev docker compose up -d --build
+	@echo "[dev] Full stack started with fast poll profile (0.45s default)."
+
+run-prod-profile:
+	INGEST_POLL_PROFILE=prod docker compose up -d --build
+	@echo ""
+	@echo "=============================================================="
+	@echo " Tremor full stack is starting (prod profile)."
+	@echo "   Poll cadence: 60s"
 	@echo "   First run downloads + curates 7 sim-days of GDELT (5-15 min)."
 	@echo "   Watch progress:"
 	@echo "     docker compose logs -f data-init"
-	@echo "   Once gdelt-vendor is healthy:"
+	@echo "   Once healthy:"
 	@echo "     curl http://localhost:18200/healthz"
 	@echo "     curl http://localhost:18200/v2/lastupdate.txt"
-	@echo "     open http://localhost:18200/docs"
+	@echo "     curl http://localhost:18600/metrics"
 	@echo "=============================================================="
 
 stop:
@@ -55,6 +77,9 @@ reset:
 
 logs:
 	docker compose logs -f gdelt-vendor
+
+logs-dashboard:
+	docker compose logs -f dashboard
 
 test:
 	python -m pytest -q
@@ -75,6 +100,9 @@ test-ci:
 
 soak-capture:
 	python tools/capture_soak_evidence.py --minutes 30 --interval-seconds 5 --output-dir data/evidence
+
+validate-restart:
+	python tools/validate_restart_safety.py
 
 vendor-chaos:
 	VENDOR_LATE_SLICE_RATE=0.05 \
