@@ -9,7 +9,7 @@ from datetime import timezone
 import pytest
 import requests
 
-from src.ingest import poller
+from src.ingest import poller, poller_logging
 
 
 class _FakeResponse:
@@ -124,7 +124,7 @@ def test_poll_once_emits_lag_check_with_expected_lag_seconds(monkeypatch):
     def _fake_parse_zip_csv(zip_bytes, *, slice_ts, file_type, logger):
         return [{"ok": "1"}]
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
     monkeypatch.setattr(poller, "_parse_zip_csv", _fake_parse_zip_csv)
 
@@ -184,7 +184,7 @@ def test_poll_once_emits_poll_metrics_summary_on_success(monkeypatch):
     def _fake_parse_zip_csv(zip_bytes, *, slice_ts, file_type, logger):
         return [{"ok": "1"}]
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
     monkeypatch.setattr(poller, "_parse_zip_csv", _fake_parse_zip_csv)
 
@@ -239,7 +239,7 @@ def test_poll_once_emits_poll_metrics_summary_on_manifest_error(monkeypatch):
     def _capture_log_event(logger, **kwargs):
         events.append(kwargs)
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
 
     manifest_url = "http://localhost:18200/v2/lastupdate.txt"
     session = _FakeSession(
@@ -274,7 +274,7 @@ def test_poll_once_emits_vendor_feed_down_alert_on_manifest_error(monkeypatch):
     def _capture_log_event(logger, **kwargs):
         events.append(kwargs)
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
 
     manifest_url = "http://localhost:18200/v2/lastupdate.txt"
     session = _FakeSession(
@@ -312,7 +312,7 @@ def test_poll_once_vendor_feed_down_alert_fires_within_timing_budget(monkeypatch
     def _capture_log_event(logger, **kwargs):
         events.append(kwargs)
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setattr(poller.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     manifest_url = "http://localhost:18200/v2/lastupdate.txt"
@@ -361,13 +361,14 @@ def test_poll_once_emits_high_lag_alert_when_threshold_exceeded(monkeypatch):
         max_retries,
         backoff_initial_seconds,
         backoff_max_seconds,
+        telemetry_hooks=None,
     ):
         return b"zip-bytes"
 
     def _fake_parse_zip_csv(zip_bytes, *, slice_ts, file_type, logger):
         return [{"ok": "1"}]
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
     monkeypatch.setattr(poller, "_parse_zip_csv", _fake_parse_zip_csv)
 
@@ -417,7 +418,7 @@ def test_poll_once_does_not_emit_vendor_clear_without_prior_fire(monkeypatch):
     def _capture_log_event(logger, **kwargs):
         events.append(kwargs)
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
 
     manifest_url = "http://localhost:18200/v2/lastupdate.txt"
     simulated_now_url = "http://localhost:18200/simulated_now"
@@ -459,7 +460,7 @@ def test_poll_once_vendor_feed_down_transitions_fire_then_clear(monkeypatch):
     def _capture_log_event(logger, **kwargs):
         events.append(kwargs)
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
 
     manifest_url = "http://localhost:18200/v2/lastupdate.txt"
     simulated_now_url = "http://localhost:18200/simulated_now"
@@ -542,13 +543,14 @@ def test_poll_once_retries_manifest_request_error_then_succeeds(monkeypatch):
         max_retries,
         backoff_initial_seconds,
         backoff_max_seconds,
+        telemetry_hooks=None,
     ):
         return b"zip-bytes"
 
     def _fake_parse_zip_csv(zip_bytes, *, slice_ts, file_type, logger):
         return [{"ok": "1"}]
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
     monkeypatch.setattr(poller, "_parse_zip_csv", _fake_parse_zip_csv)
     monkeypatch.setattr(poller.time, "sleep", lambda seconds: sleeps.append(seconds))
@@ -603,7 +605,7 @@ def test_download_and_verify_retries_transient_http_status(monkeypatch):
     def _capture_log_event(logger, **kwargs):
         events.append(kwargs)
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setattr(poller.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     payload = b"hello"
@@ -730,8 +732,8 @@ def test_poll_forever_end_to_end_poll_parse_persist(monkeypatch):
     )
 
     monkeypatch.setattr(poller.requests, "Session", lambda: session)
-    monkeypatch.setattr(poller, "_setup_logger", lambda: logger)
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "_setup_logger", lambda: logger)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
 
     iterator = poller.poll_forever(
         base_url="http://localhost:18200",
@@ -791,7 +793,7 @@ def test_build_persist_callback_compacts_checkpoints_on_schedule(monkeypatch):
     fake_module.PersistableResult = lambda **kwargs: kwargs
     fake_module.PostgresIngestStore = _FakeStore
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setitem(sys.modules, "src.ingest.storage", fake_module)
 
     persist_callback, seen, _store = poller._build_persist_callback(
@@ -842,13 +844,14 @@ def test_poll_once_logs_missing_file_type_for_partial_slice(monkeypatch):
         max_retries,
         backoff_initial_seconds,
         backoff_max_seconds,
+        telemetry_hooks=None,
     ):
         return b"zip-bytes"
 
     def _fake_parse_zip_csv(zip_bytes, *, slice_ts, file_type, logger):
         return [{"ok": file_type}]
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
     monkeypatch.setattr(poller, "_parse_zip_csv", _fake_parse_zip_csv)
 
@@ -908,13 +911,14 @@ def test_poll_once_repoll_skips_already_seen_files(monkeypatch):
         max_retries,
         backoff_initial_seconds,
         backoff_max_seconds,
+        telemetry_hooks=None,
     ):
         return b"zip-bytes"
 
     def _fake_parse_zip_csv(zip_bytes, *, slice_ts, file_type, logger):
         return [{"ok": "1"}]
 
-    monkeypatch.setattr(poller, "log_event", _capture_log_event)
+    monkeypatch.setattr(poller_logging, "log_event", _capture_log_event)
     monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
     monkeypatch.setattr(poller, "_parse_zip_csv", _fake_parse_zip_csv)
 

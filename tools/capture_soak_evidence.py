@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-import time
 
 import requests
 
@@ -16,6 +16,10 @@ def _utc_now() -> str:
 
 def _sha1_text(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()
+
+
+def _url(base_url: str, path: str) -> str:
+    return f"{base_url.rstrip('/')}{path}"
 
 
 def _safe_get_json(session: requests.Session, url: str, timeout: float) -> tuple[int | None, dict | None, str | None]:
@@ -52,7 +56,7 @@ def _capture_outage_timing(session: requests.Session, base_url: str, timeout: fl
     last_status = None
 
     while time.perf_counter() < deadline:
-        status, _, error = _safe_get_text(session, f"{base_url.rstrip('/')}/v2/lastupdate.txt", timeout)
+        status, _, error = _safe_get_text(session, _url(base_url, "/v2/lastupdate.txt"), timeout)
         samples.append({"status": status, "error": error, "at_seconds": round(time.perf_counter() - start, 3)})
         last_status = status
         if status == 503:
@@ -92,25 +96,25 @@ def main() -> int:
     dashboard_errors = 0
     outage_timing = None
 
-    dashboard_status, dashboard_json, dashboard_error = _safe_get_json(
-        session, f"{args.base_url.rstrip('/')}/metrics", args.timeout_seconds
-    )
-    if dashboard_status != 200:
-        dashboard_errors += 1
-    else:
-        outage_timing = _capture_outage_timing(session, args.base_url, args.timeout_seconds, args.interval_seconds)
-
     with requests.Session() as session, timeline_path.open("w", encoding="utf-8") as timeline:
-        for _ in range(total_samples):
+        dashboard_status, dashboard_json, dashboard_error = _safe_get_json(
+            session, _url(args.base_url, "/metrics"), args.timeout_seconds
+        )
+        if dashboard_status != 200:
+            dashboard_errors += 1
+        else:
+            outage_timing = _capture_outage_timing(session, args.base_url, args.timeout_seconds, args.interval_seconds)
+
+        for i in range(total_samples):
             at = _utc_now()
             health_status, health_json, health_error = _safe_get_json(
-                session, f"{args.base_url.rstrip('/')}/healthz", args.timeout_seconds
+                session, _url(args.base_url, "/healthz"), args.timeout_seconds
             )
             stats_status, stats_json, stats_error = _safe_get_json(
-                session, f"{args.base_url.rstrip('/')}/stats", args.timeout_seconds
+                session, _url(args.base_url, "/stats"), args.timeout_seconds
             )
             manifest_status, manifest_text, manifest_error = _safe_get_text(
-                session, f"{args.base_url.rstrip('/')}/v2/lastupdate.txt", args.timeout_seconds
+                session, _url(args.base_url, "/v2/lastupdate.txt"), args.timeout_seconds
             )
 
             if health_status != 200:
@@ -153,9 +157,7 @@ def main() -> int:
             }
             timeline.write(json.dumps(record, sort_keys=True) + "\n")
 
-            if _ < total_samples - 1:
-                import time
-
+            if i < total_samples - 1:
                 time.sleep(args.interval_seconds)
 
     summary = {

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tremor Overnight Dashboard</title>
+    <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+    <div class="wrap">
+        <div class="title">
+            <h1>Tremor Overnight Ops Dashboard</h1>
+            <div class="meta"><span id="asOf">-</span> &middot; <span id="updated">refreshing...</span></div>
+        </div>
+
+        <div id="connLost" class="conn-lost">&#9587; DASHBOARD CONNECTION LOST &mdash; last good data may be stale, do not trust the numbers below</div>
+
+        <div id="banner" class="banner good">
+            <span class="icon" id="bannerIcon">&#9679;</span>
+            <span id="bannerText">Checking system state&hellip;</span>
+            <span class="sub" id="bannerSub"></span>
+        </div>
+
+        <div class="kpi-grid">
+            <section class="panel">
+                <h2>Slice Lag</h2>
+                <div class="stat-value"><span class="icon" id="lagIcon"></span><span id="lagValue">-</span></div>
+                <div class="stat-caption" id="lagCaption"></div>
+                <div class="spark-wrap" id="lagSpark"></div>
+            </section>
+
+            <section class="panel">
+                <h2>Manifest Poll Success</h2>
+                <div class="stat-value"><span class="icon" id="pollIcon"></span><span id="pollValue">-</span></div>
+                <div class="stat-caption" id="pollCaption"></div>
+                <div class="spark-wrap" id="pollSpark"></div>
+            </section>
+
+            <section class="panel">
+                <h2>Poll Latency (p95)</h2>
+                <div class="stat-value"><span id="latValue">-</span></div>
+                <div class="stat-caption" id="latCaption"></div>
+                <div class="spark-wrap" id="latSpark"></div>
+            </section>
+
+            <section class="panel">
+                <h2>Outage Alert</h2>
+                <div class="stat-value"><span class="icon" id="outageIcon"></span><span id="outageValue">-</span></div>
+                <div class="stat-caption" id="outageCaption"></div>
+            </section>
+        </div>
+
+        <section class="panel">
+            <div class="panel-row-head">
+                <h2 style="margin-bottom:0;">Per-file-type ingestion rate &mdash; slices/min, rolling 5m</h2>
+                <div class="legend" id="ingestLegend"></div>
+                <button class="link-btn" id="toggleIngestTable">View as table</button>
+            </div>
+            <div class="chart-shell" id="ingestChart">
+                <svg id="ingestSvg" viewBox="0 0 600 190" preserveAspectRatio="none"></svg>
+                <div class="tooltip" id="ingestTooltip"></div>
+            </div>
+            <div class="table-toggle-panel" id="ingestTablePanel">
+                <table>
+                    <thead><tr><th>Time</th><th class="num">Events /min</th><th class="num">Mentions /min</th><th class="num">Articles /min</th></tr></thead>
+                    <tbody id="ingestTableBody"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel">
+            <h2>Active Alerts</h2>
+            <div id="alertsList"></div>
+        </section>
+
+        <section class="panel">
+            <h2>Recent Degraded Windows</h2>
+            <table>
+                <thead><tr><th>Type</th><th>Start</th><th>End</th><th>Active</th></tr></thead>
+                <tbody id="degradedRows"></tbody>
+            </table>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
