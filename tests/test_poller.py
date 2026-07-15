@@ -1105,3 +1105,298 @@ def test_poll_once_stale_manifest_degraded_window_transitions(monkeypatch):
     stale_calls = [c for c in degraded_calls if c.get("degraded_type") == "stale_manifest"]
     assert stale_calls[0]["active"] is True
     assert stale_calls[-1]["active"] is False
+
+
+def test_expected_slice_sequence_returns_15_minute_steps_between_bounds():
+    seq = poller._expected_slice_sequence("20240101100000", "20240101110000")
+    assert seq == ["20240101101500", "20240101103000", "20240101104500"]
+
+
+def test_expected_slice_sequence_empty_when_adjacent_or_reversed():
+    assert poller._expected_slice_sequence("20240101100000", "20240101101500") == []
+    assert poller._expected_slice_sequence("20240101101500", "20240101100000") == []
+    assert poller._expected_slice_sequence("20240101100000", "20240101100000") == []
+
+
+def _make_zip_csv(header: str, row: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("data.csv", header + "\n" + row + "\n")
+    return buf.getvalue()
+
+
+def test_poll_once_backfills_gap_between_seen_floor_and_manifest_latest():
+    logger = _test_logger()
+
+    events_header = (
+        "event_id,event_time,actor_country,target_country,event_type,intensity,"
+        "location_country,location_lat,location_lon,source_url"
+    )
+    mentions_header = "event_id,mention_time,source_domain,tone"
+    articles_header = "article_id,article_time,source_domain,primary_theme,location_country"
+
+    manifest_url = "http://localhost:18200/v2/lastupdate.txt"
+    simulated_now_url = "http://localhost:18200/simulated_now"
+    # Manifest currently advertises 10:30. The floor (from `seen`) is 10:00, so
+    # 10:15 was skipped entirely and must be backfilled directly by URL.
+    current_slice = "20240101103000"
+    gap_slice = "20240101101500"
+
+    current_bytes = _make_zip_csv(
+        events_header,
+        "9,2024-01-01T10:30:00Z,USA,CHN,statement,1.0,USA,1.00,2.00,https://example.com/a",
+    )
+    current_sha1 = poller._sha1_bytes(current_bytes)
+    manifest_text = (
+        f"{len(current_bytes)} {current_sha1} "
+        f"http://localhost:18200/v2/{current_slice}.events.csv.zip\n"
+    )
+
+    responses = {
+        manifest_url: [_FakeResponse(status_code=200, text=manifest_text)],
+        simulated_now_url: [
+            _FakeResponse(
+                status_code=200,
+                text='{"simulated_now":"2024-01-01T10:30:00Z"}',
+                json_payload={"simulated_now": "2024-01-01T10:30:00Z"},
+            )
+        ],
+        f"http://localhost:18200/v2/{current_slice}.events.csv.zip": [
+            _FakeResponse(status_code=200, text="ok", content=current_bytes)
+        ],
+        f"http://localhost:18200/v2/{gap_slice}.events.csv.zip": [
+            _FakeResponse(
+                status_code=200,
+                text="ok",
+                content=_make_zip_csv(
+                    events_header,
+                    "8,2024-01-01T10:15:00Z,USA,CHN,statement,1.0,USA,1.00,2.00,https://example.com/b",
+                ),
+            )
+        ],
+        f"http://localhost:18200/v2/{gap_slice}.mentions.csv.zip": [
+            _FakeResponse(
+                status_code=200,
+                text="ok",
+                content=_make_zip_csv(mentions_header, "8,2024-01-01T10:15:00Z,example.com,1.0"),
+            )
+        ],
+        f"http://localhost:18200/v2/{gap_slice}.articles.csv.zip": [
+            _FakeResponse(
+                status_code=200,
+                text="ok",
+                content=_make_zip_csv(articles_header, "a1,2024-01-01T10:15:00Z,example.com,protest,USA"),
+            )
+        ],
+    }
+
+    session = _SequenceSession(responses)
+
+    # Fully seen for the 10:00 floor slice across all three types; nothing
+    # seen yet for the skipped 10:15 slice.
+    seen = {
+        ("20240101100000", "events"),
+        ("20240101100000", "mentions"),
+        ("20240101100000", "articles"),
+    }
+
+    results = poller.poll_once(
+        session,
+        base_url="http://localhost:18200",
+        seen=seen,
+        logger=logger,
+        timeout_seconds=5.0,
+    )
+
+    result_keys = {(r.entry.slice_ts, r.entry.file_type) for r in results}
+    assert result_keys == {
+        (gap_slice, "events"),
+        (gap_slice, "mentions"),
+        (gap_slice, "articles"),
+        (current_slice, "events"),
+    }
+    assert (gap_slice, "events") in seen
+    assert (gap_slice, "mentions") in seen
+    assert (gap_slice, "articles") in seen
+    assert (current_slice, "events") in seen
+
+    # Backfilled entries have no manifest-provided hash to verify against;
+    # the manifest-listed current entry does.
+    backfilled = next(
+        r for r in results if r.entry.slice_ts == gap_slice and r.entry.file_type == "events"
+    )
+    assert backfilled.entry.expected_bytes is None
+    assert backfilled.entry.expected_sha1 is None
+
+    current = next(r for r in results if r.entry.slice_ts == current_slice)
+    assert current.entry.expected_bytes == len(current_bytes)
+    assert current.entry.expected_sha1 == current_sha1
+
+
+def test_poll_once_skips_backfill_on_cold_start_with_empty_seen():
+    logger = _test_logger()
+
+    manifest_url = "http://localhost:18200/v2/lastupdate.txt"
+    simulated_now_url = "http://localhost:18200/simulated_now"
+    current_slice = "20240105000000"
+    current_bytes = _make_zip_csv(
+        "event_id,event_time,actor_country,target_country,event_type,intensity,"
+        "location_country,location_lat,location_lon,source_url",
+        "1,2024-01-05T00:00:00Z,USA,CHN,statement,1.0,USA,1.00,2.00,https://example.com/a",
+    )
+    current_sha1 = poller._sha1_bytes(current_bytes)
+    manifest_text = (
+        f"{len(current_bytes)} {current_sha1} "
+        f"http://localhost:18200/v2/{current_slice}.events.csv.zip\n"
+    )
+
+    # Only the current slice's URL is registered. If backfill wrongly fired
+    # for a cold start (empty `seen`, no floor), any gap request would hit an
+    # unregistered URL and _FakeSession raises AssertionError.
+    session = _FakeSession(
+        {
+            manifest_url: _FakeResponse(status_code=200, text=manifest_text),
+            simulated_now_url: _FakeResponse(
+                status_code=200,
+                text='{"simulated_now":"2024-01-05T00:00:00Z"}',
+                json_payload={"simulated_now": "2024-01-05T00:00:00Z"},
+            ),
+            f"http://localhost:18200/v2/{current_slice}.events.csv.zip": _FakeResponse(
+                status_code=200, text="ok", content=current_bytes
+            ),
+        }
+    )
+
+    results = poller.poll_once(
+        session,
+        base_url="http://localhost:18200",
+        seen=set(),
+        logger=logger,
+        timeout_seconds=5.0,
+    )
+
+    assert len(results) == 1
+    assert results[0].entry.slice_ts == current_slice
+
+
+def test_poll_once_caps_backfill_at_max_slices_per_poll(monkeypatch):
+    logger = _test_logger()
+    attempted_urls = []
+
+    def _fake_download_and_verify(
+        session,
+        entry,
+        logger,
+        timeout_seconds,
+        max_retries,
+        backoff_initial_seconds,
+        backoff_max_seconds,
+        telemetry_hooks=None,
+    ):
+        attempted_urls.append(entry.url)
+        return None
+
+    monkeypatch.setattr(poller, "_download_and_verify", _fake_download_and_verify)
+
+    manifest_url = "http://localhost:18200/v2/lastupdate.txt"
+    simulated_now_url = "http://localhost:18200/simulated_now"
+    current_slice = "20240102000000"  # a full day (96 slices) after the floor
+    manifest_text = (
+        f"100 {'1' * 40} http://localhost:18200/v2/{current_slice}.events.csv.zip\n"
+    )
+    session = _FakeSession(
+        {
+            manifest_url: _FakeResponse(status_code=200, text=manifest_text),
+            simulated_now_url: _FakeResponse(
+                status_code=200,
+                text='{"simulated_now":"2024-01-02T00:00:00Z"}',
+                json_payload={"simulated_now": "2024-01-02T00:00:00Z"},
+            ),
+        }
+    )
+
+    seen = {
+        ("20240101000000", "events"),
+        ("20240101000000", "mentions"),
+        ("20240101000000", "articles"),
+    }
+
+    poller.poll_once(
+        session,
+        base_url="http://localhost:18200",
+        seen=set(seen),
+        logger=logger,
+        timeout_seconds=5.0,
+        max_backfill_slices_per_poll=5,
+    )
+
+    backfill_urls = [u for u in attempted_urls if current_slice not in u]
+    assert len(backfill_urls) == 5 * 3
+
+
+def test_poll_once_backfills_partial_file_type_at_seen_floor():
+    """A partial slice at the floor (some file types seen, one never listed
+    again once the manifest moves on) must have its missing type recovered
+    directly by URL -- not just slices strictly between floor and current.
+    """
+    logger = _test_logger()
+
+    events_header = (
+        "event_id,event_time,actor_country,target_country,event_type,intensity,"
+        "location_country,location_lat,location_lon,source_url"
+    )
+    articles_header = "article_id,article_time,source_domain,primary_theme,location_country"
+
+    manifest_url = "http://localhost:18200/v2/lastupdate.txt"
+    simulated_now_url = "http://localhost:18200/simulated_now"
+    # Floor slice 10:00 was only ever seen for events/mentions -- articles
+    # was chaos-hidden from the manifest and never listed before the
+    # manifest advanced to the very next slice, 10:15 (adjacent -- no
+    # strictly-between gap at all).
+    floor_slice = "20240101100000"
+    current_slice = "20240101101500"
+
+    current_bytes = _make_zip_csv(
+        events_header,
+        "9,2024-01-01T10:15:00Z,USA,CHN,statement,1.0,USA,1.00,2.00,https://example.com/a",
+    )
+    current_sha1 = poller._sha1_bytes(current_bytes)
+    manifest_text = (
+        f"{len(current_bytes)} {current_sha1} "
+        f"http://localhost:18200/v2/{current_slice}.events.csv.zip\n"
+    )
+
+    floor_articles_bytes = _make_zip_csv(
+        articles_header, "a1,2024-01-01T10:00:00Z,example.com,protest,USA"
+    )
+
+    session = _FakeSession(
+        {
+            manifest_url: _FakeResponse(status_code=200, text=manifest_text),
+            simulated_now_url: _FakeResponse(
+                status_code=200,
+                text='{"simulated_now":"2024-01-01T10:15:00Z"}',
+                json_payload={"simulated_now": "2024-01-01T10:15:00Z"},
+            ),
+            f"http://localhost:18200/v2/{current_slice}.events.csv.zip": _FakeResponse(
+                status_code=200, text="ok", content=current_bytes
+            ),
+            f"http://localhost:18200/v2/{floor_slice}.articles.csv.zip": _FakeResponse(
+                status_code=200, text="ok", content=floor_articles_bytes
+            ),
+        }
+    )
+
+    seen = {(floor_slice, "events"), (floor_slice, "mentions")}
+
+    results = poller.poll_once(
+        session,
+        base_url="http://localhost:18200",
+        seen=seen,
+        logger=logger,
+        timeout_seconds=5.0,
+    )
+
+    result_keys = {(r.entry.slice_ts, r.entry.file_type) for r in results}
+    assert (floor_slice, "articles") in result_keys
+    assert (floor_slice, "articles") in seen

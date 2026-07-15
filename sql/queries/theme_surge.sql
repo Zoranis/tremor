@@ -1,11 +1,17 @@
 -- Top 10 themes by growth: last 24h vs trailing 7-day baseline.
-WITH current_window AS (
+-- "Now" is anchored to the latest ingested mention_time, not wall-clock
+-- NOW() -- see protest_hotspots.sql for why.
+WITH latest AS (
+    SELECT MAX(mention_time) AS ts FROM mentions
+),
+current_window AS (
     SELECT
         primary_theme,
         COUNT(*)::float AS mentions_24h
     FROM articles a
     JOIN mentions m ON m.slice_ts = a.slice_ts
-    WHERE m.mention_time >= NOW() - INTERVAL '24 hours'
+    CROSS JOIN latest
+    WHERE m.mention_time >= latest.ts - INTERVAL '24 hours'
     GROUP BY primary_theme
 ),
 baseline_window AS (
@@ -14,8 +20,9 @@ baseline_window AS (
         COUNT(*)::float / 7.0 AS baseline_daily_mentions
     FROM articles a
     JOIN mentions m ON m.slice_ts = a.slice_ts
-    WHERE m.mention_time >= NOW() - INTERVAL '8 days'
-      AND m.mention_time < NOW() - INTERVAL '24 hours'
+    CROSS JOIN latest
+    WHERE m.mention_time >= latest.ts - INTERVAL '8 days'
+      AND m.mention_time < latest.ts - INTERVAL '24 hours'
     GROUP BY primary_theme
 )
 SELECT

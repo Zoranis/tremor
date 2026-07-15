@@ -42,11 +42,12 @@ class PostgresIngestStore:
 
     def load_seen(self) -> set[tuple[str, str]]:
         conn = self._require_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT slice_ts, file_type FROM ingest_checkpoints WHERE status = 'done'"
-            )
-            return {(str(slice_ts), str(file_type)) for slice_ts, file_type in cur.fetchall()}
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT slice_ts, file_type FROM ingest_checkpoints WHERE status = 'done'"
+                )
+                return {(str(slice_ts), str(file_type)) for slice_ts, file_type in cur.fetchall()}
 
     def persist(self, result: PersistableResult) -> None:
         conn = self._require_conn()

@@ -1,10 +1,16 @@
 -- Yesterday's top 10 countries by protest/clash event volume.
-WITH yesterday_events AS (
-    SELECT location_country
-    FROM events
-    WHERE event_time >= date_trunc('day', NOW() - INTERVAL '1 day')
-      AND event_time < date_trunc('day', NOW())
-      AND event_type IN ('protest', 'clash')
+-- "Yesterday" is anchored to the latest ingested event_time, not wall-clock
+-- NOW() -- the replay window tracks its own simulated clock (fixed
+-- historical dates), not the calendar date the query happens to run on.
+WITH latest AS (
+    SELECT MAX(event_time) AS ts FROM events
+),
+yesterday_events AS (
+    SELECT e.location_country
+    FROM events e, latest
+    WHERE e.event_time >= date_trunc('day', latest.ts - INTERVAL '1 day')
+      AND e.event_time < date_trunc('day', latest.ts)
+      AND e.event_type IN ('protest', 'clash')
 )
 SELECT
     location_country,

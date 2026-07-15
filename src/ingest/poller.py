@@ -9,7 +9,7 @@ import logging
 import re
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
@@ -23,12 +23,17 @@ FILENAME_RE = re.compile(
 EXPECTED_FILE_TYPES = ("events", "mentions", "articles")
 FILE_TYPE_ORDER = {name: i for i, name in enumerate(EXPECTED_FILE_TYPES)}
 TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+SLICE_STEP = timedelta(minutes=15)
+# Worst case under default settings (60s prod poll vs. 0.45s/slice replay) is
+# ~133 slices between polls; this leaves headroom while still bounding a
+# single poll's backfill burst if the gap is much larger (e.g. long downtime).
+DEFAULT_MAX_BACKFILL_SLICES_PER_POLL = 300
 
 
 @dataclass(frozen=True)
 class ManifestEntry:
-    expected_bytes: int
-    expected_sha1: str
+    expected_bytes: int | None
+    expected_sha1: str | None
     url: str
     slice_ts: str
     file_type: str
@@ -222,6 +227,26 @@ def _fetch_simulated_now(
         return None
 
     return candidate
+
+
+def _expected_slice_sequence(after_ts: str, before_ts: str) -> list[str]:
+    """15-minute-boundary slice_ts values strictly between after_ts and before_ts.
+
+    Used to find slices the manifest skipped over between two observations —
+    either because the poller polled slower than the vendor's replay advanced,
+    or because the poller was down and missed one or more manifest updates.
+    """
+    start_dt = _parse_ts_yyyymmddhhmmss(after_ts)
+    end_dt = _parse_ts_yyyymmddhhmmss(before_ts)
+    if start_dt is None or end_dt is None or start_dt >= end_dt:
+        return []
+
+    out: list[str] = []
+    cur = start_dt + SLICE_STEP
+    while cur < end_dt:
+        out.append(cur.strftime("%Y%m%d%H%M%S"))
+        cur += SLICE_STEP
+    return out
 
 
 def _backoff_delay_seconds(*, attempt: int, initial: float, maximum: float) -> float:
@@ -439,7 +464,13 @@ def _download_and_verify(
 
     zip_bytes = response.content
     actual_bytes = len(zip_bytes)
-    if actual_bytes != entry.expected_bytes:
+    actual_sha1 = _sha1_bytes(zip_bytes)
+
+    # Backfilled entries (see poll_once) have no manifest-provided hash to
+    # check against — the manifest never re-lists a slice once it's no longer
+    # current, so we fetch those directly by URL and settle for the zip/CSV
+    # structural check in _parse_zip_csv instead of byte-perfect verification.
+    if entry.expected_bytes is not None and actual_bytes != entry.expected_bytes:
         log_event(
             logger,
             action="file_verify",
@@ -463,8 +494,7 @@ def _download_and_verify(
         )
         return None
 
-    actual_sha1 = _sha1_bytes(zip_bytes)
-    if actual_sha1 != entry.expected_sha1:
+    if entry.expected_sha1 is not None and actual_sha1 != entry.expected_sha1:
         log_event(
             logger,
             action="file_verify",
@@ -496,6 +526,7 @@ def _download_and_verify(
         file_type=entry.file_type,
         bytes=actual_bytes,
         sha1=actual_sha1,
+        verified=entry.expected_sha1 is not None,
     )
     _call_hook(
         telemetry_hooks,
@@ -643,6 +674,81 @@ def _emit_alert_events(
         alert_state["lag_high_active_by_file_type"] = lag_high_active_by_file_type
 
 
+def _process_entry(
+    session: requests.Session,
+    entry: ManifestEntry,
+    seen: set[tuple[str, str]],
+    results: list[PollResult],
+    logger: logging.Logger,
+    *,
+    timeout_seconds: float,
+    max_retries: int,
+    backoff_initial_seconds: float,
+    backoff_max_seconds: float,
+    telemetry_hooks: dict[str, TelemetryHook] | None = None,
+) -> None:
+    """Download, verify, and parse one manifest or backfill entry.
+
+    Shared by the current-manifest loop and the gap-backfill loop in
+    poll_once — both just need "fetch this (slice_ts, file_type), skip if
+    already seen, append to results on success."
+    """
+    key = (entry.slice_ts, entry.file_type)
+    if key in seen:
+        log_event(
+            logger,
+            action="file_process",
+            result="skip_seen",
+            slice_ts=entry.slice_ts,
+            file_type=entry.file_type,
+        )
+        return
+
+    if telemetry_hooks is None:
+        zip_bytes = _download_and_verify(
+            session,
+            entry,
+            logger,
+            timeout_seconds,
+            max_retries=max_retries,
+            backoff_initial_seconds=backoff_initial_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+        )
+    else:
+        zip_bytes = _download_and_verify(
+            session,
+            entry,
+            logger,
+            timeout_seconds,
+            max_retries=max_retries,
+            backoff_initial_seconds=backoff_initial_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+            telemetry_hooks=telemetry_hooks,
+        )
+    if zip_bytes is None:
+        return
+
+    rows = _parse_zip_csv(
+        zip_bytes,
+        slice_ts=entry.slice_ts,
+        file_type=entry.file_type,
+        logger=logger,
+    )
+    if rows is None:
+        return
+
+    seen.add(key)
+    results.append(PollResult(entry=entry, rows=rows))
+    log_event(
+        logger,
+        action="file_process",
+        result="parsed_rows",
+        slice_ts=entry.slice_ts,
+        file_type=entry.file_type,
+        row_count=len(rows),
+    )
+
+
 def poll_once(
     session: requests.Session,
     *,
@@ -655,6 +761,7 @@ def poll_once(
     backoff_max_seconds: float = 2.0,
     alert_manifest_error_threshold: int = 3,
     alert_lag_seconds_threshold: float = 1800.0,
+    max_backfill_slices_per_poll: int = DEFAULT_MAX_BACKFILL_SLICES_PER_POLL,
     alert_state: dict[str, object] | None = None,
     telemetry_hooks: dict[str, TelemetryHook] | None = None,
 ) -> list[PollResult]:
@@ -821,60 +928,91 @@ def poll_once(
                 )
 
     results: list[PollResult] = []
+
+    # Backfill: if the durable checkpoint set's highest slice_ts is more than
+    # one step behind what the manifest now shows as current, the manifest
+    # advanced past one or more slices we never attempted — either because
+    # this poll's cadence is slower than the vendor's replay speed, or because
+    # the poller was down/restarted and missed manifest updates entirely. The
+    # manifest never re-lists a slice once it's no longer current, but the
+    # vendor still serves any curated slice directly by URL, so we can fetch
+    # the gap ourselves instead of silently losing it.
+    floor_slice_ts = max((slice_ts for slice_ts, _ in seen), default=None)
+    if (
+        floor_slice_ts is not None
+        and manifest_latest_slice is not None
+        and floor_slice_ts < manifest_latest_slice
+    ):
+        gap_slices = _expected_slice_sequence(floor_slice_ts, manifest_latest_slice)
+        # The floor slice itself may be a partial slice: one or more of its
+        # file types were never seen (e.g. chaos-hidden from every manifest)
+        # before the manifest moved on to a later slice_ts. The manifest
+        # never re-lists a slice once it's no longer current, so a type
+        # missing at the floor would be lost forever if we only walked the
+        # strictly-between range — the vendor still serves it directly by
+        # URL, so fold it into the same backfill sweep.
+        floor_has_gap = any((floor_slice_ts, ft) not in seen for ft in EXPECTED_FILE_TYPES)
+        backfill_slices = ([floor_slice_ts] if floor_has_gap else []) + gap_slices
+        if backfill_slices:
+            if len(backfill_slices) > max_backfill_slices_per_poll:
+                log_event(
+                    logger,
+                    action="backfill",
+                    result="capped",
+                    level=logging.WARNING,
+                    floor_slice_ts=floor_slice_ts,
+                    manifest_latest_slice=manifest_latest_slice,
+                    gap_slice_count=len(backfill_slices),
+                    cap=max_backfill_slices_per_poll,
+                )
+                backfill_slices = backfill_slices[:max_backfill_slices_per_poll]
+            else:
+                log_event(
+                    logger,
+                    action="backfill",
+                    result="gap_detected",
+                    level=logging.WARNING,
+                    floor_slice_ts=floor_slice_ts,
+                    manifest_latest_slice=manifest_latest_slice,
+                    gap_slice_count=len(backfill_slices),
+                )
+
+            for gap_slice_ts in backfill_slices:
+                for file_type in EXPECTED_FILE_TYPES:
+                    if (gap_slice_ts, file_type) in seen:
+                        continue
+                    backfill_entry = ManifestEntry(
+                        expected_bytes=None,
+                        expected_sha1=None,
+                        url=f"{base_url.rstrip('/')}/v2/{gap_slice_ts}.{file_type}.csv.zip",
+                        slice_ts=gap_slice_ts,
+                        file_type=file_type,
+                    )
+                    _process_entry(
+                        session,
+                        backfill_entry,
+                        seen,
+                        results,
+                        logger,
+                        timeout_seconds=timeout_seconds,
+                        max_retries=max_retries,
+                        backoff_initial_seconds=backoff_initial_seconds,
+                        backoff_max_seconds=backoff_max_seconds,
+                        telemetry_hooks=telemetry_hooks,
+                    )
+
     for entry in entries:
-        key = (entry.slice_ts, entry.file_type)
-        if key in seen:
-            log_event(
-                logger,
-                action="file_process",
-                result="skip_seen",
-                slice_ts=entry.slice_ts,
-                file_type=entry.file_type,
-            )
-            continue
-
-        if telemetry_hooks is None:
-            zip_bytes = _download_and_verify(
-                session,
-                entry,
-                logger,
-                timeout_seconds,
-                max_retries=max_retries,
-                backoff_initial_seconds=backoff_initial_seconds,
-                backoff_max_seconds=backoff_max_seconds,
-            )
-        else:
-            zip_bytes = _download_and_verify(
-                session,
-                entry,
-                logger,
-                timeout_seconds,
-                max_retries=max_retries,
-                backoff_initial_seconds=backoff_initial_seconds,
-                backoff_max_seconds=backoff_max_seconds,
-                telemetry_hooks=telemetry_hooks,
-            )
-        if zip_bytes is None:
-            continue
-
-        rows = _parse_zip_csv(
-            zip_bytes,
-            slice_ts=entry.slice_ts,
-            file_type=entry.file_type,
-            logger=logger,
-        )
-        if rows is None:
-            continue
-
-        seen.add(key)
-        results.append(PollResult(entry=entry, rows=rows))
-        log_event(
+        _process_entry(
+            session,
+            entry,
+            seen,
+            results,
             logger,
-            action="file_process",
-            result="parsed_rows",
-            slice_ts=entry.slice_ts,
-            file_type=entry.file_type,
-            row_count=len(rows),
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            backoff_initial_seconds=backoff_initial_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+            telemetry_hooks=telemetry_hooks,
         )
 
     latest_lag_seconds_by_file_type: dict[str, float] = {}
@@ -988,6 +1126,7 @@ def poll_forever(
     backoff_max_seconds: float = 2.0,
     alert_manifest_error_threshold: int = 3,
     alert_lag_seconds_threshold: float = 1800.0,
+    max_backfill_slices_per_poll: int = DEFAULT_MAX_BACKFILL_SLICES_PER_POLL,
     seen: set[tuple[str, str]] | None = None,
     persist_callback: PersistCallback | None = None,
     telemetry_hooks: dict[str, TelemetryHook] | None = None,
@@ -1015,6 +1154,7 @@ def poll_forever(
                 backoff_max_seconds=backoff_max_seconds,
                 alert_manifest_error_threshold=alert_manifest_error_threshold,
                 alert_lag_seconds_threshold=alert_lag_seconds_threshold,
+                max_backfill_slices_per_poll=max_backfill_slices_per_poll,
                 alert_state=alert_state,
                 telemetry_hooks=telemetry_hooks,
             ):
@@ -1101,6 +1241,16 @@ def main() -> int:
     parser.add_argument("--alert-manifest-error-threshold", type=int, default=3)
     parser.add_argument("--alert-lag-seconds-threshold", type=float, default=1800.0)
     parser.add_argument(
+        "--max-backfill-slices-per-poll",
+        type=int,
+        default=DEFAULT_MAX_BACKFILL_SLICES_PER_POLL,
+        help=(
+            "Cap on how many missed slices to backfill (via direct per-slice GET) "
+            "in a single poll when the manifest has advanced past slices we "
+            "never attempted."
+        ),
+    )
+    parser.add_argument(
         "--database-url",
         default="",
         help="Optional PostgreSQL DSN. If set, parsed rows are upserted and checkpoints are persisted.",
@@ -1170,6 +1320,7 @@ def main() -> int:
             backoff_max_seconds=args.backoff_max_seconds,
             alert_manifest_error_threshold=alert_manifest_error_threshold,
             alert_lag_seconds_threshold=args.alert_lag_seconds_threshold,
+            max_backfill_slices_per_poll=args.max_backfill_slices_per_poll,
             seen=seen,
             persist_callback=persist_callback,
             telemetry_hooks=telemetry_hooks,
